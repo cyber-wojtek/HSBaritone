@@ -631,14 +631,7 @@ public class MovementParkour extends Movement {
     public MovementState updateState(MovementState state) {
         super.updateState(state);
         if (state.getStatus() != MovementStatus.RUNNING) return state;
-        if (ctx.playerFeet().equals(dest)) {
-            if (DEBUG && DEBUG_PHASES) {
-                HELPER.logDebug(String.format("[Parkour][SUCCESS] src=%s → dest=%s  airborne ticks=%d",
-                        src, dest, airborneTimer));
-            }
-            return state.setStatus(MovementStatus.SUCCESS);
-        }
-
+        
         float jumpYaw = (float) Math.toDegrees(yawRad);
         float currentYaw = ctx.playerRotations().getYaw();
 
@@ -666,6 +659,24 @@ public class MovementParkour extends Movement {
         double pz      = ctx.player().position().z - (src.z + 0.5);
         double projFwd = px * (-sinYaw) + pz *  cosYaw;
         double projLat = px *   cosYaw  + pz *  sinYaw;
+        boolean fwdOk = Math.abs(projFwd - startFwdOffset) <= 0.06;
+        boolean latOk = Math.abs(projLat - startLatOffset) <= 0.06;
+        double posDelta = projFwd - lastSettleFwd;
+        lastSettleFwd = projFwd;
+
+        if (ctx.playerFeet().equals(dest)) {
+            if (posDelta > 0.06) 
+            {
+                return state;
+            }
+            
+            if (DEBUG && DEBUG_PHASES) {
+                HELPER.logDebug(String.format("[Parkour][SUCCESS] src=%s → dest=%s  airborne ticks=%d",
+                        src, dest, airborneTimer));
+            }
+            
+            return state.setStatus(MovementStatus.SUCCESS);
+        }
 
         switch (phase) {
 
@@ -675,12 +686,6 @@ public class MovementParkour extends Movement {
                     lastSettleFwd = projFwd;
                     settleTimer   = 1;
                 }
-
-                boolean fwdOk = Math.abs(projFwd - startFwdOffset) <= 0.06;
-                boolean latOk = Math.abs(projLat - startLatOffset) <= 0.06;
-
-                double posDelta = projFwd - lastSettleFwd;
-                lastSettleFwd = projFwd;
 
                 if (fwdOk && latOk) {
                     if (posDelta < 0.06) {
