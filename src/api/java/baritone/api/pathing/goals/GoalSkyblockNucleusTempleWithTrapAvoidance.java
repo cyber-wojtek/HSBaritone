@@ -18,6 +18,7 @@
 package baritone.api.pathing.goals;
 
 import baritone.api.Settings;
+import baritone.api.utils.Helper;
 import baritone.api.utils.SkyblockNucleusTempleArrowPhysics;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
@@ -25,6 +26,8 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.projectile.AbstractArrow;
 import net.minecraft.world.level.block.DispenserBlock;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 
 /**
@@ -77,11 +80,13 @@ public final class GoalSkyblockNucleusTempleWithTrapAvoidance implements Goal {
     private final Minecraft  mc;
 
     private State     state             = State.SAFE;
-    private BlockPos  dispenserPos      = null;   // the actual dispenser block
+    private List<BlockPos> dispenserPoses = null; // all dispensers threatening this corridor
     private long      arrowDetectedTime = 0;
     private boolean   committed         = false;  // once true, never block again
 
     private static final double CYLINDER_RADIUS = 2.5;
+
+
 
     public GoalSkyblockNucleusTempleWithTrapAvoidance(Goal wrappedGoal, Settings settings) {
         this.wrappedGoal = Objects.requireNonNull(wrappedGoal, "wrappedGoal");
@@ -114,15 +119,26 @@ public final class GoalSkyblockNucleusTempleWithTrapAvoidance implements Goal {
 
         ensureDispenserScanned(playerPos);
 
-        if (dispenserPos == null) {
+        // DEBUG — log every tick so we can see what's happening
+        Helper.HELPER.logDebug("[TrapAvoid] state=" + state
+                + " player=" + playerPos
+                + " dispensers=" + dispenserPoses
+                + " freshArrow=" + anyFreshArrow()
+        );
+
+        if (dispenserPoses == null || dispenserPoses.isEmpty()) {
             state = State.SAFE;
             return true;
         }
 
         switch (state) {
             case SAFE:
-                if (playerPos.distSqr(dispenserPos) <= DANGER_ZONE_DIST_SQ) {
-                    state = State.WAITING_FOR_ARROW;
+                // Enter danger zone if near ANY threatening dispenser
+                for (BlockPos dispenser : dispenserPoses) {
+                    if (playerPos.distSqr(dispenser) <= DANGER_ZONE_DIST_SQ) {
+                        state = State.WAITING_FOR_ARROW;
+                        break;
+                    }
                 }
                 return true;
 
@@ -151,115 +167,175 @@ public final class GoalSkyblockNucleusTempleWithTrapAvoidance implements Goal {
     // -------------------------------------------------------------------------
 
     private void ensureDispenserScanned(BlockPos playerPos) {
-        if (dispenserPos != null) return;
-        dispenserPos = scanForFacingDispenser(playerPos);
+        if (dispenserPoses != null) return;
+        dispenserPoses = scanForFacingDispensers(playerPos);
+        if (dispenserPoses != null && !dispenserPoses.isEmpty()) {
+            // immediately enter waiting state — don't wait for a second tick to notice
+            state = State.WAITING_FOR_ARROW;
+        }
     }
 
-    /**
-     * Scans nearby blocks for a dispenser whose facing direction aims an arrow
-     * at the player's current position.  Returns the dispenser's block position,
-     * or {@code null} if none is found.
-     */
-    private BlockPos scanForFacingDispenser(BlockPos playerPos) {
+    private List<BlockPos> scanForFacingDispensers(BlockPos playerPos) {
+        BlockPos goalPos = getGoalPosition();
+        Helper.HELPER.logDebug("[TrapAvoid] scanning for dispensers around player=" + playerPos
+                + " with goal=" + goalPos
+                + " range=" + settings.skyblockNucleusTempleTrapDetectionRange.value);
+
+        if (goalPos == null) {
+            Helper.HELPER.logDebug("[TrapAvoid] no goal position — scan aborted");
+            return null;
+        }
+
+        List<BlockPos> found = new ArrayList<>();
         int range = settings.skyblockNucleusTempleTrapDetectionRange.value;
 
         for (int ox = -range; ox <= range; ox++) {
             for (int oy = -range; oy <= range; oy++) {
                 for (int oz = -range; oz <= range; oz++) {
                     BlockPos candidate = playerPos.offset(ox, oy, oz);
+                    assert mc.level != null;
                     var blockState = mc.level.getBlockState(candidate);
                     if (!(blockState.getBlock() instanceof DispenserBlock)) continue;
 
                     var facing = blockState.getValue(DispenserBlock.FACING);
-                    int dx = facing.getStepX();
-                    int dy = facing.getStepY();
-                    int dz = facing.getStepZ();
 
-                    BlockPos ray = candidate;
-                    for (int step = 0; step < range; step++) {
-                        ray = ray.offset(dx, dy, dz);
-                        if (mc.level.getBlockState(ray).blocksMotion()) break;
-                        if (ray.distSqr(playerPos) <= DANGER_ZONE_DIST_SQ) {
-                            return candidate; // return the dispenser, not the ray position
-                        }
+                    // Dispenser centre and player centre in world space
+                    double dcx = candidate.getX() + 0.5;
+                    double dcy = candidate.getY() + 0.5;
+                    double dcz = candidate.getZ() + 0.5;
+                    double pcx = playerPos.getX() + 0.5;
+                    double pcy = playerPos.getY() + 0.5;
+                    double pcz = playerPos.getZ() + 0.5;
+
+                    // Is this a purely vertical dispenser (UP/DOWN)?
+                    boolean isFacingVertically = (facing.getStepY() != 0
+                            && facing.getStepX() == 0
+                            && facing.getStepZ() == 0);
+
+                    double perpDist;
+                    boolean dispenserInFront;
+
+                    if (!isFacingVertically) {
+                        // ---- Horizontal dispenser: flatten to X/Z ----
+                        double rdx = facing.getStepX();
+                        double rdz = facing.getStepZ();
+
+                        double tpx = pcx - dcx;
+                        double tpz = pcz - dcz;
+                        double t   = tpx * rdx + tpz * rdz;
+
+                        double rx = pcx - (dcx + t * rdx);
+                        double rz = pcz - (dcz + t * rdz);
+                        perpDist       = Math.sqrt(rx * rx + rz * rz);
+                        dispenserInFront = (t > 0);
+
+                    } else {
+                        // ---- Vertical dispenser: full 3-D check ----
+                        double rdy = facing.getStepY();
+
+                        double tpy = pcy - dcy;
+                        double t   = tpy * rdy;
+
+                        double rx = pcx - dcx;
+                        double rz = pcz - dcz;
+                        perpDist       = Math.sqrt(rx * rx + rz * rz);
+                        dispenserInFront = (t > 0);
+                    }
+
+                    Helper.HELPER.logDebug("[TrapAvoid] candidate dispenser at " + candidate
+                            + " facing=" + facing
+                            + " vertical=" + isFacingVertically
+                            + " perpDist=" + String.format("%.3f", perpDist)
+                            + " inFront=" + dispenserInFront);
+
+                    if (dispenserInFront && perpDist <= CYLINDER_RADIUS) {
+                        Helper.HELPER.logDebug("[TrapAvoid] >>> MATCH — dispenser threatens corridor");
+                        found.add(candidate);
                     }
                 }
             }
         }
-        return null;
+        return found.isEmpty() ? null : found;
     }
 
-    /** Returns true if any arrow in the level appears freshly fired from the known dispenser. */
+    /** Returns true if any arrow in the level appears freshly fired from any tracked dispenser. */
     private boolean anyFreshArrow() {
+        if (dispenserPoses == null || dispenserPoses.isEmpty()) return false;
+        int total = 0, fresh = 0;
         assert mc.level != null;
         for (Entity entity : mc.level.entitiesForRendering()) {
-            if (entity instanceof AbstractArrow arrow
-                    && isFreshlyFired(arrow)) {
+            if (!(entity instanceof AbstractArrow arrow)) continue;
+            total++;
+            if (isFreshlyFired(arrow)) fresh++;
+        }
+        Helper.HELPER.logDebug("[TrapAvoid] total arrows=" + total + " fresh arrows=" + fresh);
+        return fresh > 0;
+    }
+
+    private boolean arrowHasCleared(BlockPos playerPos) {
+        if (dispenserPoses == null || dispenserPoses.isEmpty()) return false;
+        assert mc.level != null;
+
+        // Dispensers fire perpendicular to corridor: just check if any fresh arrow
+        // from a tracked dispenser is currently inside the corridor cylinder.
+        // No direction projection needed — if it's in the cylinder, it's a threat.
+        for (Entity entity : mc.level.entitiesForRendering()) {
+            if (!(entity instanceof AbstractArrow arrow)) continue;
+            if (!isFreshlyFired(arrow)) continue;
+
+            // Check if arrow is inside corridor cylinder around player position
+            double dx = arrow.getX() - (playerPos.getX() + 0.5);
+            double dy = arrow.getY() - (playerPos.getY() + 0.5);
+            double dz = arrow.getZ() - (playerPos.getZ() + 0.5);
+
+            // Cylinder: ignore Y, just check X/Z distance
+            double perpDistSq = dx*dx + dz*dz;
+            if (perpDistSq <= CYLINDER_RADIUS * CYLINDER_RADIUS) {
+                Helper.HELPER.logDebug("[TrapAvoid] arrowHasCleared: arrow in cylinder at ("
+                        + String.format("%.1f,%.1f,%.1f", arrow.getX(), arrow.getY(), arrow.getZ()) + ")");
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * True if this arrow is freshly fired from any tracked dispenser.
+     * Checks spawn proximity + velocity threshold to avoid stale/decayed arrows.
+     */
+    private boolean isFreshlyFired(AbstractArrow arrow) {
+        var vel = arrow.getDeltaMovement();
+        double speed = vel.length();
+
+        // Skip stale arrows: drag decay reduces velocity; fresh dispenser arrows start ~1.1 blocks/tick
+        if (speed < 0.9) return false;
+
+        // Detect if arrow was just fired: check if position is near ANY tracked dispenser
+        for (BlockPos dispenser : dispenserPoses) {
+            double dx = arrow.getX() - (dispenser.getX() + 0.5);
+            double dy = arrow.getY() - (dispenser.getY() + 0.5);
+            double dz = arrow.getZ() - (dispenser.getZ() + 0.5);
+            double distSq = dx*dx + dy*dy + dz*dz;
+            if (distSq <= CYLINDER_RADIUS * CYLINDER_RADIUS) {
                 return true;
             }
         }
         return false;
     }
 
-    private boolean arrowHasCleared(BlockPos playerPos) {
-        BlockPos goalPos = getGoalPosition();
-        if (goalPos == null) return false;
-
-        double ox = playerPos.getX() + 0.5;
-        double oy = playerPos.getY() + 0.5;
-        double oz = playerPos.getZ() + 0.5;
-
-        double rdx = goalPos.getX() + 0.5 - ox;
-        double rdy = goalPos.getY() + 0.5 - oy;
-        double rdz = goalPos.getZ() + 0.5 - oz;
-        double len = Math.sqrt(rdx * rdx + rdy * rdy + rdz * rdz);
-        if (len < 0.001) return true;
-        rdx /= len; rdy /= len; rdz /= len;
-
-        assert mc.level != null;
-        for (Entity entity : mc.level.entitiesForRendering()) {
-            if (!(entity instanceof AbstractArrow arrow)) continue;
-            if (!isFreshlyFired(arrow)) continue;
-
-            double ax = arrow.getX() - ox;
-            double ay = arrow.getY() - oy;
-            double az = arrow.getZ() - oz;
-
-            double proj = ax * rdx + ay * rdy + az * rdz;
-            double perpX = ax - proj * rdx;
-            double perpY = ay - proj * rdy;
-            double perpZ = az - proj * rdz;
-            double perpDist = Math.sqrt(perpX * perpX + perpY * perpY + perpZ * perpZ);
-
-            if (!(proj > 0 && perpDist > CYLINDER_RADIUS)) return false;
-        }
-        return true;
-    }
-
-    /**
-     * True if this arrow is freshly fired rather than stuck or resting.
-     * Speed² >= 0.5 and moving away from the known dispenser.
-     */
-    private boolean isFreshlyFired(AbstractArrow arrow) {
-        var vel = arrow.getDeltaMovement();
-        double speedSq = vel.x * vel.x + vel.y * vel.y + vel.z * vel.z;
-        if (speedSq < 0.5) return false;
-
-        double dx = arrow.getX() - (dispenserPos.getX() + 0.5);
-        double dy = arrow.getY() - (dispenserPos.getY() + 0.5);
-        double dz = arrow.getZ() - (dispenserPos.getZ() + 0.5);
-        return (dx * vel.x + dy * vel.y + dz * vel.z) > 0;
-    }
-
     private BlockPos getGoalPosition() {
-        if (wrappedGoal instanceof GoalBlock gb) return gb.getGoalPos();
+        Goal target = wrappedGoal;
+        if (target instanceof GoalWrapperSkyblockNucleusTempleTrapAvoid wrapper) {
+            target = wrapper.getWrapped();
+        }
+        if (target instanceof GoalBlock gb) return gb.getGoalPos();
         return null;
     }
 
     private void commit() {
         committed     = true;
         state         = State.SAFE;
-        dispenserPos  = null;
+        dispenserPoses  = null;
     }
 
     // -------------------------------------------------------------------------
@@ -267,13 +343,13 @@ public final class GoalSkyblockNucleusTempleWithTrapAvoidance implements Goal {
     // -------------------------------------------------------------------------
 
     public State    getState()          { return state; }
-    public BlockPos getDispenserPos()   { return dispenserPos; }
+    public List<BlockPos> getDispenserPoses()   { return dispenserPoses; }
     public Goal     getWrappedGoal()    { return wrappedGoal; }
 
     /** Call when the path is recalculated to reset avoidance state. */
     public void reset() {
         state         = State.SAFE;
-        dispenserPos  = null;
+        dispenserPoses  = null;
         committed     = false;
         arrowDetectedTime = 0;
     }

@@ -1,619 +1,820 @@
 /*
  * This file is part of Baritone.
- * ... [license header unchanged] ...
+ *
+ * Baritone is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Lesser General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * Baritone is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with Baritone.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 package baritone.pathing.movement.movements;
 
-import baritone.Baritone;
-import baritone.api.BaritoneAPI;
 import baritone.api.IBaritone;
 import baritone.api.pathing.movement.MovementStatus;
 import baritone.api.utils.BetterBlockPos;
 import baritone.api.utils.Rotation;
-import baritone.api.utils.RotationUtils;
 import baritone.api.utils.input.Input;
-import net.minecraft.world.phys.Vec3;
 import baritone.pathing.movement.CalculationContext;
 import baritone.pathing.movement.Movement;
 import baritone.pathing.movement.MovementHelper;
 import baritone.pathing.movement.MovementState;
-import baritone.utils.BlockStateInterface;
-import baritone.utils.pathing.MutableMoveResult;
-import net.minecraft.core.Direction;
-import net.minecraft.world.level.block.Block;
-import net.minecraft.world.level.block.Blocks;
-import net.minecraft.world.level.block.StairBlock;
-import net.minecraft.world.level.block.state.BlockState;
-import net.minecraft.world.level.material.WaterFluid;
+import net.minecraft.util.Mth;
+import net.minecraft.world.phys.AABB;
 
 import java.util.HashSet;
 import java.util.Set;
 
+/**
+ * Sprint-jump (parkour) movement — fully tick-based simulation.
+ *
+ * Physics are ported exactly from the Python reference simulator:
+ *
+ *   Ground tick order (per tick, simulate_runup):
+ *     gv = gv * f + groundAccel
+ *     gx += gv * (-sinYaw)
+ *     gz += gv *   cosYaw
+ *     // per-tick check: if fwdPos > MAX_FWD_POS → skip this combo
+ *
+ *   Jump tick order (apply_jump_tick — one extra ground tick at the moment of jumping):
+ *     gv_launch = gv * GROUND_F + groundAccel
+ *     jx = gx + gv_launch * (-sinYaw);  jz = gz + gv_launch * cosYaw
+ *     vx = (gv_launch + h_boost) * (-sinYaw)   // h_boost = SPRINT_JUMP_BOOST if sprint
+ *     vz = (gv_launch + h_boost) *   cosYaw
+ *     vy = JUMP_VELOCITY + jumpBoost * INCREMENT
+ *
+ *   Air tick order (simulate_airborne, starting from jx/jz):
+ *     vx += airAccel * (-sinYaw); vz += airAccel * cosYaw  // air acceleration
+ *     nx = jx + vx; ny = y + vy; nz = jz + vz             // candidate position
+ *     landing check: y >= landY && ny <= landY             // "will-cross" style
+ *       → interpolate to exact Y=landY crossing: lx = x + f*(nx-x), lz = z + f*(nz-z)
+ *       → if [lx,lz] in [dest-0.1, dest+1.1] → SUCCESS
+ *       → if ny < landY-0.5 → bail (fell past)
+ *     x=nx; y=ny; z=nz                                     // commit move
+ *     vx *= AIR_DRAG; vz *= AIR_DRAG                      // horizontal drag
+ *     vy = (vy - GRAVITY) * VERTICAL_DRAG                  // vertical update
+ *
+ * Runtime execution uses a position-based jump trigger: the sim records the
+ * exact forward projection of the player at the moment of jumping (post-jump-tick
+ * position jx/jz), and the RUN_UP phase fires the jump as soon as the player's
+ * real forward projection reaches or exceeds that value.
+ */
 public class MovementParkour extends Movement {
 
-    private static final BetterBlockPos[] EMPTY = new BetterBlockPos[]{};
+    /**
+     * Master debug switch — set true to enable all parkour diagnostic output.
+     * Each category can also be toggled independently below.
+     */
+    private static final boolean DEBUG = true;
 
-    // === PHYSICS CONSTANTS (Minecraft 1.19+) ===
-    private static final double GRAVITY = 0.08;
-    private static final double VERTICAL_DRAG = 0.98;
-    private static final double HORIZONTAL_DRAG_AIR = 0.91;
-    private static final double GROUND_ACCEL_BASE = 0.1;
-    private static final double SPRINT_JUMP_BOOST = 0.2;
-    private static final double AIR_ACCEL = 0.02;
-    private static final double JUMP_VELOCITY_BASE = 0.42;
+    // Fine-grained toggles (only take effect when DEBUG == true)
+    /** Log the best plan found by calculateCost and why others were rejected. */
+    private static final boolean DEBUG_COST     = true;
+    /** Log every phase transition and jump-trigger evaluation at runtime. */
+    private static final boolean DEBUG_PHASES   = true;
+    /** Log each air-tick position/velocity during the sim (verbose). */
+    private static final boolean DEBUG_AIR_TICKS = false;
+    /** Log per-tick runtime projFwd/projLat while in RUN_UP. */
+    private static final boolean DEBUG_RUNUP     = false;
 
-    // Slipperiness values
-    private static final double SLIP_DEFAULT = 0.6;
-    private static final double SLIP_ICE = 0.98;
-    private static final double SLIP_SLIME = 0.8;
+    // ── Minecraft physics constants (match Python sim exactly) ───────────────
+    private static final double AIR_DRAG             = 0.91;
+    private static final double GRAVITY              = 0.08;
+    private static final double VERTICAL_DRAG        = 0.98;
+    private static final double AIR_ACCEL_BASE       = 0.02;
+    private static final double SPRINT_MULTIPLIER    = 1.3;
+    private static final double AIR_ACCEL_SPRINT     = AIR_ACCEL_BASE * SPRINT_MULTIPLIER; // 0.026
+    private static final double AIR_ACCEL_WALK       = AIR_ACCEL_BASE;                     // 0.02
+    private static final double JUMP_VELOCITY        = 0.42;
+    private static final double SPRINT_JUMP_BOOST    = 0.2;   // horizontal boost on sprint-jump
+    private static final double JUMP_BOOST_INCREMENT = 0.1;   // per Jump Boost amplifier level
+    private static final float YAW_PACKET_EPSILON_DEGREES = 0.71f; // 360.0f / 256.0f / 2.0f
 
-    // Movement type multipliers
-    private static final double MT_SPRINT = 1.3;
-    private static final double MT_WALK = 1.0;
+    // Ground physics — default block slipperiness = 0.6
+    // f = slipperiness * AIR_DRAG = 0.6 * 0.91 = 0.546
+    // groundAccel = 0.1 * speedMult * (0.6 / slipperiness)^3
+    // For default blocks (slip=0.6): (0.6/0.6)^3 = 1, so accel = 0.1 * speedMult
+    private static final double DEFAULT_SLIPPERINESS  = 0.6;
+    private static final double GROUND_F              = DEFAULT_SLIPPERINESS * AIR_DRAG; // 0.546
+    private static final double GROUND_ACCEL_SPRINT_NO_BASE   = SPRINT_MULTIPLIER * Math.pow(0.6 / DEFAULT_SLIPPERINESS, 3); // 0.13
+    private static final double GROUND_ACCEL_WALK_NO_BASE     = 1.0             * Math.pow(0.6 / DEFAULT_SLIPPERINESS, 3); // 0.10
 
-    // Minimum horizontal speed (projected onto jump axis) needed at jump-off.
-    // Sprint steady-state is ~0.364 m/t; we require at least 80% of that.
-    private static final double MIN_JUMP_SPEED = 0.28;
-
-    private final double angleRad;      // Direction in radians (0 = +Z, clockwise)
-    private final int horizontalDist;   // Horizontal distance in blocks
-    private final int vertDelta;        // Vertical displacement (-2 to +2)
-    private final boolean requiresSprint;
+    // ── Player geometry ───────────────────────────────────────────────────────
+    private static final double PLAYER_WIDTH  = 0.6;
+    private static final double PLAYER_HEIGHT = 1.8;
 
     /**
-     * Set to true once we have issued a back-up maneuver so we never loop.
-     * Volatile because updateState is called every tick from the game thread.
+     * Landing pad margin — player centre must land within [dest - LAND_PAD, dest + 1 + LAND_PAD].
+     * Matches Python LAND_PAD = PLAYER_WIDTH / 2 = 0.3.
      */
-    private volatile boolean backupDone = false;
+    private static final double LAND_PAD = 0.3;
+
+    private static final float YAW_ISSUED_SENTINEL = Float.POSITIVE_INFINITY;
 
     /**
-     * Cached backup target position, computed once when needed.
-     * Null if no backup is required (player already has enough speed).
+     * Maximum forward extension from source block centre before the player is
+     * fully off the block.  0.5 (half block) + 0.3 (half player width) = 0.8
+     * Matches Python's MAX_FWD_POS.
      */
-    private volatile net.minecraft.world.phys.Vec3 cachedBackupTarget = null;
+    private static final double MAX_FWD_POS = 0.5 + PLAYER_WIDTH / 2.0; // 0.8
 
-    public MovementParkour(IBaritone baritone, BetterBlockPos src, double angle, int dist, int vertDelta) {
-        super(baritone, src, computeDest(src, angle, dist, vertDelta), EMPTY,
-                computeLandingSupport(src, angle, dist, vertDelta));
-        this.angleRad = angle;
-        this.horizontalDist = dist;
-        this.vertDelta = vertDelta;
-        this.requiresSprint = dist >= 4 || vertDelta > 0;
-    }
+    // ── Simulation limits ─────────────────────────────────────────────────────
+    private static final int    MAX_RUNUP_TICKS    = 20;
+    private static final int    MAX_AIR_TICKS      = 60;
 
-    private static BetterBlockPos computeDest(BetterBlockPos src, double angle, int dist, int vertDelta) {
-        // Minecraft forward vector: dx = -sin(yaw), dz = cos(yaw)
-        return new BetterBlockPos(
-                (int) Math.floor(src.x - Math.sin(angle) * dist),
-                src.y + vertDelta,
-                (int) Math.floor(src.z + Math.cos(angle) * dist)
-        );
-    }
+    // Start-position sweep: -0.65 … +0.20 in steps of 0.05 (matches Python)
+    private static final double START_SWEEP_MIN    = -0.65;
+    private static final double START_SWEEP_MAX    =  0.20;
+    private static final double START_SWEEP_STEP   =  0.05;
 
-    private static BetterBlockPos computeLandingSupport(BetterBlockPos src, double angle, int dist, int vertDelta) {
-        // Minecraft forward vector: dx = -sin(yaw), dz = cos(yaw)
-        int lx = (int) Math.floor(src.x - Math.sin(angle) * dist);
-        int lz = (int) Math.floor(src.z + Math.cos(angle) * dist);
-        // The support block is always one below where the player's feet land.
-        int ly = src.y + vertDelta - 1;
-        return new BetterBlockPos(lx, ly, lz);
-    }
+    // Lateral sweep
+    private static final double MAX_LATERAL_OFFSET = 0.2;
+    private static final double LATERAL_SWEEP_STEP = 0.05;
 
-    // === PUBLIC API ===
-
-    public static MovementParkour cost(CalculationContext context, BetterBlockPos src, Direction direction) {
-        return cost(context, src, directionToAngle(direction), 0);
-    }
+    // ── Geometry ──────────────────────────────────────────────────────────────
+    private final int    dx, dz, dy;
+    private final double horizDist;
+    private final boolean ascend;
+    private final double yawRad;
+    private final double sinYaw, cosYaw;
+    // ── Results of calculateCost ──────────────────────────────────────────────
+    private double  startFwdOffset;
+    private double  startLatOffset;
+    private boolean bestIsSprint;
+    private int     bestN;           // ground ticks to run before jumping (kept for reference / fallback)
+    private float settledYaw = Float.NaN;
+    private boolean lastInputWasForward = false;
 
     /**
-     * Calculate parkour with any angle and vertical offset.
-     * @param angleRad Direction in radians (0 = +Z/south, clockwise)
-     * @param vertOffset Vertical displacement (-2 to +2)
+     * Forward projection (along jump direction, relative to src block centre)
+     * of the player position at the exact tick the sim fires the jump.
+     * At runtime we jump as soon as projFwd >= jumpTriggerFwd instead of
+     * counting ticks, making the trigger immune to tick-rate drift.
      */
-    public static MovementParkour cost(CalculationContext context, BetterBlockPos src, double angleRad, int vertOffset) {
-        MutableMoveResult res = new MutableMoveResult();
-        cost(context, src.x, src.y, src.z, angleRad, vertOffset, res);
-        if (res.x == src.x && res.y == src.y && res.z == src.z) return null; // No valid move
+    private double jumpTriggerFwd;
 
-        int dist = (int) Math.round(Math.hypot(res.x - src.x, res.z - src.z));
-        int vDelta = res.y - src.y;
-        return new MovementParkour(context.getBaritone(), src, angleRad, dist, vDelta);
+    /**
+     * Lateral projection at jump time (same coordinate system as jumpTriggerFwd).
+     * Stored for debugging / future lateral-correction logic.
+     */
+    private double jumpTriggerLat;
+
+    // ── Runtime state ─────────────────────────────────────────────────────────
+    private enum Phase { BACK_UP, SETTLE, RUN_UP, AIRBORNE }
+    private Phase phase         = Phase.BACK_UP;
+    private int   settleTimer   = 0;
+    private int   airborneTimer = 0;
+    private double lastSettleFwd = 0.0;
+    private int   runupTick     = 0;  // counts ground ticks since RUN_UP began
+
+    // =========================================================================
+
+    public MovementParkour(IBaritone baritone, BetterBlockPos src, BetterBlockPos dest) {
+        super(baritone, src, dest, new BetterBlockPos[0], null);
+        this.dx        = dest.x - src.x;
+        this.dz        = dest.z - src.z;
+        this.dy        = dest.y - src.y;
+        this.horizDist = Math.sqrt((double) dx * dx + (double) dz * dz);
+        this.ascend    = dy > 0;
+        this.yawRad    = Math.atan2(-dx, dz);
+        this.sinYaw = snapToExact(Math.sin(yawRad));
+        this.cosYaw = snapToExact(Math.cos(yawRad));
     }
 
-    private static double directionToAngle(Direction dir) {
-        return switch (dir) {
-            case SOUTH -> 0;
-            case WEST -> Math.PI / 2;
-            case NORTH -> Math.PI;
-            case EAST -> -Math.PI / 2;
-            default -> 0;
-        };
-    }
-
-    // === CORE COST CALCULATION ===
-
-    public static void cost(CalculationContext context, int x, int y, int z,
-                            double angle, int vertOffset, MutableMoveResult res) {
-        if (!context.allowParkour || (y >= context.world.getMaxY() && !context.allowJumpAtBuildLimit)) return;
-
-        double sin = Math.sin(angle), cos = Math.cos(angle);
-        BlockState standingOn = context.get(x, y - 1, z);
-
-        // === PRE-FLIGHT CHECKS ===
-        if (!preFlightChecks(context, x, y, z, sin, cos, standingOn)) return;
-
-        // === PHYSICS SETUP ===
-        double slipperiness = getSlipperiness(standingOn);
-        double drag = HORIZONTAL_DRAG_AIR * slipperiness;
-        double mt = context.canSprint ? MT_SPRINT : MT_WALK;
-        double groundAccel = GROUND_ACCEL_BASE * mt * Math.pow(0.6 / slipperiness, 3);
-        double maxDist = computeMaxJumpDistance(standingOn, context, slipperiness);
-
-        if (Baritone.settings().parkourDebugTelemetry.value) {
-            debugParkour("SIM: src=(" + x + "," + y + "," + z + ") angle=" + angle + " vertOffset=" + vertOffset + " maxDist=" + maxDist);
-        }
-        // === TRAJECTORY SIMULATION ===
-        for (double dist = 2; dist <= maxDist; dist += 0.1) {
-            TrajectoryResult result = simulateTrajectory(context, x, y, z, angle, dist, vertOffset,
-                    slipperiness, drag, groundAccel, mt);
-            if (result.valid) {
-                // Don't use parkour for trivial flat jumps of 1-2 blocks - walking is always better
-                if (vertOffset == 0 && dist <= 2) {
-                    debugParkour("SIM: rejected trivial flat jump dist=" + dist);
-                    continue;
-                }
-                res.set(result.destX, result.destY, result.destZ, result.cost + context.jumpPenalty);
-                debugParkour("SIM: valid trajectory to (" + result.destX + "," + result.destY + "," + result.destZ + ") cost=" + result.cost);
-                return;
-            }
-        }
-
-        // === PARKOUR-PLACE FALLBACK ===
-        if (context.allowParkourPlace) {
-            debugParkour("FALLBACK: attempting parkour-place fallback");
-            attemptParkourPlace(context, x, y, z, angle, vertOffset, sin, cos, res, groundAccel, mt);
-        }
-    }
-
-    private static boolean preFlightChecks(CalculationContext ctx, int x, int y, int z,
-                                           double sin, double cos, BlockState standingOn) {
-        // For any angle, check all blocks the player's foot might enter on the first step.
-        // We check the block directly in front (rounded), and for diagonals the two
-        // axis-aligned neighbours that could be clipped.
-        // Minecraft forward vector: dx = -sin(yaw), dz = cos(yaw)
-        int ax = x - (int) Math.round(sin);
-        int az = z + (int) Math.round(cos);
-        if (!MovementHelper.fullyPassable(ctx, ax, y, az)) return false;
-        // Also check the two cardinal-adjacent blocks for diagonal angles — at y+1 (head clearance).
-        // These are the platform's side faces at foot level which are often solid; only the space
-        // ABOVE them (head height) actually needs to be clear for the player to leave at that angle.
-        if (Math.abs(sin) > 0.1 && Math.abs(cos) > 0.1) {
-            if (!MovementHelper.fullyPassable(ctx, x - (int) Math.signum(sin), y + 1, z)) return false;
-            if (!MovementHelper.fullyPassable(ctx, x, y + 1, z + (int) Math.signum(cos))) return false;
-        }
-
-        // Prefer walking over parkour — check adjacent block
-        BlockState adj = ctx.get(ax, y - 1, az);
-        if (MovementHelper.canWalkOn(ctx, ax, y - 1, az, adj)) return false;
-        if (MovementHelper.avoidWalkingInto(adj) && !(adj.getFluidState().getType() instanceof WaterFluid)) return false;
-
-        // Headroom check
-        for (int dy = 1; dy <= 2; dy++) {
-            if (!MovementHelper.fullyPassable(ctx, x, y + dy, z)) return false;
-        }
-
-        // Invalid takeoff surfaces
-        Block block = standingOn.getBlock();
-        if (block == Blocks.VINE || block == Blocks.LADDER || block instanceof StairBlock ||
-                MovementHelper.isBottomSlab(standingOn)) return false;
-        if (ctx.assumeWalkOnWater && !standingOn.getFluidState().isEmpty()) return false;
-        if (!ctx.get(x, y, z).getFluidState().isEmpty()) return false; // Can't jump from water
-
-        return true;
-    }
-
-    private static double getSlipperiness(BlockState state) {
-        Block b = state.getBlock();
-        if (b == Blocks.SLIME_BLOCK) return SLIP_SLIME;
-        if (b == Blocks.ICE || b == Blocks.PACKED_ICE || b == Blocks.BLUE_ICE) return SLIP_ICE;
-        return SLIP_DEFAULT;
-    }
-
-    private static double computeMaxJumpDistance(BlockState standingOn, CalculationContext ctx, double slip) {
-        if (ctx.allowWalkOnMagmaBlocks && standingOn.is(Blocks.MAGMA_BLOCK)) return 2;
-        if (standingOn.getBlock() == Blocks.SOUL_SAND) return 2;
-        if (!ctx.canSprint) return 3;
-
-        // With accurate physics, sprint-jumps can reliably reach 5 blocks
-        // Ice is slippery but still allows long slides - allow up to 6
-        return (slip >= SLIP_ICE) ? 6 : 5.5;
-    }
-
-    // === TRAJECTORY SIMULATION (Physics-Based) ===
-
-    private static class TrajectoryResult {
-        final boolean valid, hardObstructed;
-        final int destX, destY, destZ;
-        final double cost;
-        TrajectoryResult(boolean v, boolean ho, int dx, int dy, int dz, double c) {
-            valid = v; hardObstructed = ho; destX = dx; destY = dy; destZ = dz; cost = c;
-        }
-    }
-
-    private static TrajectoryResult simulateTrajectory(CalculationContext ctx, int sx, int sy, int sz,
-                                                       double angle, double targetDist, int targetVert,
-                                                       double slip, double drag, double groundAccel, double mt) {
-
-        double sin = Math.sin(angle), cos = Math.cos(angle);
-        // Pre-calculate intended destination to ignore it during collision checks
-        // Use floor to match computeDest() and Minecraft's block containment logic
-        // Minecraft forward vector: dx = -sin(yaw), dz = cos(yaw)
-        int destX = (int) Math.floor(sx - sin * targetDist);
-        int destY = sy + targetVert;
-        int destZ = (int) Math.floor(sz + cos * targetDist);
-
-        double baseSpeed = ctx.canSprint ? 0.28 * MT_SPRINT : 0.28 * MT_WALK;
-        // Velocity components split by angle; magnitude is constant regardless of direction.
-        // Minecraft forward vector: vx = -sin * speed, vz = cos * speed
-        double vx = -sin * baseSpeed + (ctx.canSprint ? -sin * SPRINT_JUMP_BOOST : 0);
-        double vz = cos * baseSpeed + (ctx.canSprint ? cos * SPRINT_JUMP_BOOST : 0);
-        double vy = JUMP_VELOCITY_BASE + 0.1 * ctx.jumpBoostLevel;
-        // Start simulation from 0.85 blocks back from center along jump angle
-        // This matches execution trigger and gives more horizontal distance for clearing jumps
-        double px = sx + 0.5 - sin * 0.85;
-        double py = sy;
-        double pz = sz + 0.5 + cos * 0.85;
-        final int MAX_TICKS = 25;
-
-        for (int tick = 0; tick < MAX_TICKS; tick++) {
-            px += vx;
-            py += vy;
-            pz += vz;
-
-            // Apply air drag and acceleration (Minecraft forward vector: dx = -sin, dz = cos)
-            vx = vx * HORIZONTAL_DRAG_AIR - sin * AIR_ACCEL * mt;
-            vz = vz * HORIZONTAL_DRAG_AIR + cos * AIR_ACCEL * mt;
-            vy = (vy - GRAVITY) * VERTICAL_DRAG;
-
-            // Pass destination coordinates to collision check
-            if (!isPlayerClear(ctx, px, py, pz, destX, destY, destZ, sin, cos)) {
-                debugParkour("SIM: obstructed at tick=" + tick + " pos=(" + px + ", " + py + ", " + pz + ")");
-                return new TrajectoryResult(false, true, 0, 0, 0, 0);
-            }
-
-            double currentDist = Math.hypot(px - (sx + 0.5), pz - (sz + 0.5));
-            if (currentDist >= targetDist - 0.5) {
-                debugParkour("SIM: evaluating landing at tick=" + tick + " pos=(" + px + ", " + py + ", " + pz + ")");
-                return evaluateLanding(ctx, sx, sy, sz, angle, targetDist, targetVert, sin, cos, py, tick);
-            }
-            if (py < sy - 4) return new TrajectoryResult(false, true, 0, 0, 0, 0);
-        }
-        return new TrajectoryResult(false, false, 0, 0, 0, 0);
-    }
-
-    private static boolean isPlayerClear(CalculationContext ctx, double x, double y, double z,
-                                         int destX, int destY, int destZ, double sin, double cos) {
-        // Check player AABB corners: width ±0.3, height 0 (feet) and 1 (upper body).
-        // For diagonal movement, the AABB sweeps a parallelogram; expand bounds accordingly.
-        double cardinalness = Math.max(Math.abs(sin), Math.abs(cos));
-        double sweepExpansion = 0.15 * (1.0 - cardinalness);
-        double halfWidth = 0.3 + sweepExpansion;
-
-        for (int dx = 0; dx <= 1; dx++) {
-            for (int dy = 0; dy <= 1; dy++) {
-                for (int dz = 0; dz <= 1; dz++) {
-                    int bx = (int) Math.floor(x - halfWidth + dx * (halfWidth * 2));
-                    int by = (int) Math.floor(y + dy);
-                    int bz = (int) Math.floor(z - halfWidth + dz * (halfWidth * 2));
-
-                    // Allow the trajectory to intersect the destination block.
-                    // Final landing validation is handled safely in evaluateLanding().
-                    if (bx == destX && by == destY && bz == destZ) continue;
-
-                    if (!MovementHelper.fullyPassable(ctx, bx, by, bz)) return false;
-                }
-            }
-        }
-        return true;
-    }
-
-    private static TrajectoryResult evaluateLanding(CalculationContext ctx, int sx, int sy, int sz,
-                                                    double angle, double dist, int vertOffset,
-                                                    double sin, double cos, double currentY, int ticksUsed) {
-        // Use floor to match computeDest() and Minecraft's block containment logic
-        // Minecraft forward vector: dx = -sin(yaw), dz = cos(yaw)
-        int lx = (int) Math.floor(sx - sin * dist);
-        int lz = (int) Math.floor(sz + cos * dist);
-        int ly = sy + vertOffset;
-
-        BlockState landingInto = ctx.bsi.get0(lx, ly, lz);
-        BlockState landingOn = ctx.bsi.get0(lx, ly - 1, lz);
-
-        // Allow a small margin for landing position (±0.2 blocks)
-        double expectedX = sx - sin * dist;
-        double expectedZ = sz + cos * dist;
-        // Compute angle-aware landing margin: interpolate continuously based on angle.
-        // Cardinal (0°, 90°): ~0.25 margin; 45°: ~0.15; smooth interpolation between.
-        double cardinalness = Math.max(Math.abs(sin), Math.abs(cos));
-        double margin = 0.25 - (1.0 - cardinalness) * 0.125;
-        margin = Math.max(0.15, Math.min(0.25, margin));
-        boolean withinMargin = Math.abs(expectedX - lx) <= margin && Math.abs(expectedZ - lz) <= margin;
-
-        if (vertOffset > 0) {
-            // Ascending: land on top of the block at (lx, ly-1, lz).
-            // landingOn is the surface block; landingInto is the air block at feet level — must be passable.
-            if (withinMargin &&
-                    MovementHelper.fullyPassable(ctx, lx, ly, lz) &&
-                    MovementHelper.canWalkOn(ctx, lx, ly - 1, lz, landingOn) &&
-                    checkOvershootSafety(ctx.bsi, lx - (int)Math.round(sin), ly + 1, lz + (int)Math.round(cos))) {
-                double cost = costFromJumpDistance(dist) + vertOffset * 0.8 + ticksUsed * 0.1;
-                return new TrajectoryResult(true, false, lx, ly, lz, cost);
-            }
-        } else {
-            // Flat/descending: land on top
-            boolean validLanding = (landingOn.getBlock() != Blocks.FARMLAND &&
-                    MovementHelper.canWalkOn(ctx, lx, ly - 1, lz, landingOn)) ||
-                    (Math.min(16, ctx.frostWalker + 2) >= dist &&
-                            MovementHelper.canUseFrostWalker(ctx, landingOn));
-            if (withinMargin && validLanding && checkOvershootSafety(ctx.bsi, lx + (int)Math.round(sin), ly, lz + (int)Math.round(cos))) {
-                double cost = costFromJumpDistance(dist) + Math.abs(vertOffset) * 0.4 + ticksUsed * 0.1;
-                return new TrajectoryResult(true, false, lx, ly, lz, cost);
-            }
-        }
-        return new TrajectoryResult(false, false, lx, ly, lz, 0);
-    }
-
-    private static boolean checkOvershootSafety(BlockStateInterface bsi, int x, int y, int z) {
-        return !MovementHelper.avoidWalkingInto(bsi.get0(x, y, z)) &&
-                !MovementHelper.avoidWalkingInto(bsi.get0(x, y + 1, z));
-    }
-
-    private static double costFromJumpDistance(double dist) {
-        if (dist <= 2) return WALK_ONE_BLOCK_COST * dist;
-        if (dist <= 3) return SPRINT_ONE_BLOCK_COST * dist;
-        if (dist <= 6) return SPRINT_ONE_BLOCK_COST * dist * 1.2;
-        return COST_INF;
-    }
-
-    // === PARKOUR-PLACE SUPPORT ===
-
-    private static void attemptParkourPlace(CalculationContext ctx, int sx, int sy, int sz,
-                                            double angle, int vertOffset, double sin, double cos,
-                                            MutableMoveResult res, double groundAccel, double mt) {
-        for (int dist = 5; dist >= 2; dist--) {
-            // Minecraft forward vector: dx = -sin(yaw), dz = cos(yaw)
-            int dx = (int) Math.round(sx - sin * dist);
-            int dz = (int) Math.round(sz + cos * dist);
-
-            BlockState toReplace = ctx.get(dx, sy - 1, dz);
-            double placeCost = ctx.costOfPlacingAt(dx, sy - 1, dz, toReplace);
-            if (placeCost >= COST_INF || !MovementHelper.isReplaceable(dx, sy - 1, dz, toReplace, ctx.bsi)) continue;
-            if (!checkOvershootSafety(ctx.bsi, dx - (int)Math.round(sin), sy, dz + (int)Math.round(cos))) continue;
-
-            // Find valid adjacent face for placement
-            for (Direction dir : Direction.Plane.HORIZONTAL) {
-                int ax = dx + dir.getStepX(), ay = sy - 1, az = dz + dir.getStepZ();
-                double placeAngle = directionToAngle(dir);
-                // Avoid placing against incoming direction (can't turn fast enough mid-air)
-                if (Math.abs(angle - placeAngle) < 0.3) continue;
-
-                if (MovementHelper.canPlaceAgainst(ctx.bsi, ax, ay, az)) {
-                    res.set(dx, sy, dz, costFromJumpDistance(dist) + placeCost + ctx.jumpPenalty);
-                    debugParkour("PARKOUR-PLACE: placed at (" + dx + "," + sy + "," + dz + ") cost=" + (costFromJumpDistance(dist) + placeCost + ctx.jumpPenalty));
-                    return;
-                }
-            }
-        }
-    }
-
-    // === MOVEMENT INTERFACE ===
+    // =========================================================================
+    //  Cost calculation
+    // =========================================================================
 
     @Override
     public double calculateCost(CalculationContext context) {
-        MutableMoveResult res = new MutableMoveResult();
-        cost(context, src.x, src.y, src.z, angleRad, vertDelta, res);
-        return (res.x == dest.x && res.y == dest.y && res.z == dest.z) ? res.cost : COST_INF;
-    }
+        if (!context.allowParkour)               return COST_INF;
+        if (src.distanceTo(dest) > 5.2) return COST_INF;
+        if (dy > 1)                              return COST_INF;
+        if (phase != Phase.BACK_UP)                 return COST_INF; // parkour in progress (do NOT try to start a new one)
 
-    @Override
-    protected Set<BetterBlockPos> calculateValidPositions() {
-        Set<BetterBlockPos> set = new HashSet<>();
-        double sin = Math.sin(angleRad), cos = Math.cos(angleRad);
-        // Minecraft forward vector: dx = -sin(yaw), dz = cos(yaw)
-        for (int i = 0; i <= horizontalDist; i++) {
-            int bx = (int) Math.round(src.x - sin * i);
-            int bz = (int) Math.round(src.z + cos * i);
-            for (int dy = -1; dy <= 2; dy++) {
-                set.add(new BetterBlockPos(bx, src.y + dy, bz));
+
+        if (!MovementHelper.canWalkOn(context, src.x, src.y - 1, src.z))       return COST_INF;
+        if (!MovementHelper.canWalkThrough(context, src.x, src.y + 1, src.z))  return COST_INF;
+        if (!MovementHelper.canWalkThrough(context, src.x, src.y + 2, src.z))  return COST_INF;
+        if (!isValidLanding(context, dest.x, dest.y, dest.z))                  return COST_INF;
+        if (ascend && !MovementHelper.canWalkThrough(context, dest.x, dest.y + 2, dest.z)) return COST_INF;
+
+        // No parkour needed if there is solid ground the whole way
+        boolean hasGap = false;
+        for (int i = 1; i < (int) horizDist; i++) {
+            int cx = src.x + (int) Math.round(dx * i / horizDist);
+            int cz = src.z + (int) Math.round(dz * i / horizDist);
+            if (!MovementHelper.canWalkOn(context, cx, src.y - 1, cz)) { hasGap = true; break; }
+        }
+        if (!hasGap) return COST_INF;
+
+        int    bestN         = Integer.MAX_VALUE;
+        double bestFwd       = 0;
+        double bestLat       = 0;
+        boolean bestSprint   = true;
+        double bestJumpFwd   = 0;
+        double bestJumpLat   = 0;
+        double bestScoreErr  = Double.MAX_VALUE;
+        boolean bestSuccess  = false;
+
+        double destCx = dest.x + 0.5;
+        double destCz = dest.z + 0.5;
+
+        // Sweep both sprint and walk physics, matching the Python solver exactly.
+        for (boolean isSprint : new boolean[]{true, false}) {
+            final double groundAccelNoBase = isSprint ? GROUND_ACCEL_SPRINT_NO_BASE : GROUND_ACCEL_WALK_NO_BASE;
+            final double groundAccel = groundAccelNoBase * context.playerMovementSpeed;
+            logDebug(String.format("Testing %s: groundAccel=%.4f (no base %.4f)", isSprint ? "SPRINT" : "walk", groundAccel, groundAccelNoBase));
+
+            for (int N = 0; N <= MAX_RUNUP_TICKS; N++) {
+                for (int latIdx = 0; latIdx <= (int)Math.floor(MAX_LATERAL_OFFSET / LATERAL_SWEEP_STEP) + 1; latIdx++) {
+                    double absLat = latIdx * LATERAL_SWEEP_STEP;
+
+                    double[] lats = (absLat < 1e-9) ? new double[]{0.0} : new double[]{absLat, -absLat};
+
+                    for (double lat : lats) {
+                        // Sweep start positions from back to front (−0.65 … +0.20).
+                        for (double startFwd = START_SWEEP_MIN; startFwd <= START_SWEEP_MAX + 1e-9; startFwd += START_SWEEP_STEP) {
+
+                            // ── Ground simulation (matches Python simulate_runup) ──────────
+                            double gx = src.x + 0.5 + startFwd * (-sinYaw) + lat * cosYaw;
+                            double gz = src.z + 0.5 + startFwd *   cosYaw  + lat * sinYaw;
+                            double gv = 0.0;
+                            boolean runupValid = true;
+
+                            for (int k = 0; k < N; k++) {
+                                double vMid = gv + groundAccel;  // pre-friction speed
+                                gx += vMid * (-sinYaw);          // pos advances by pre-friction
+                                gz += vMid *   cosYaw;
+                                gv  = vMid * GROUND_F;           // store post-friction velocity
+                                // Mid-runup check: don't walk off the edge (matches Python)
+                                double midFwd = (gx - (src.x + 0.5)) * (-sinYaw)
+                                        + (gz - (src.z + 0.5)) * cosYaw;
+                                if (midFwd > MAX_FWD_POS) { runupValid = false; break; }
+                            }
+                            if (!runupValid) continue;
+
+                            // Post-runup check: player must still be on source block.
+                            double fwdPos = (gx - (src.x + 0.5)) * (-sinYaw)
+                                    + (gz - (src.z + 0.5)) *   cosYaw;
+                            if (fwdPos > MAX_FWD_POS) continue;
+
+                            if (startFwd < -0.5) {
+                                int behindX = src.x - (int) Math.signum(dx);
+                                int behindZ = src.z - (int) Math.signum(dz);
+                                if (!MovementHelper.canWalkOn(context,      behindX, src.y - 1, behindZ)) continue;
+                                if (!MovementHelper.canWalkThrough(context, behindX, src.y,     behindZ)) continue;
+                                if (!MovementHelper.canWalkThrough(context, behindX, src.y + 1, behindZ)) continue;
+                            }
+
+                            // ── Airborne simulation (includes apply_jump_tick internally) ────
+                            double jumpHBoost = isSprint ? SPRINT_JUMP_BOOST : 0.0;
+                            double vMidJump = gv + groundAccel;                    // pre-friction speed
+                            double jx = gx + vMidJump * (-sinYaw);                // pos advances by pre-friction
+                            double jz = gz + vMidJump *   cosYaw;
+                            double gvLaunch = vMidJump * GROUND_F + jumpHBoost;   // stored dM + sprint boost
+                            double jtf = (jx - (src.x + 0.5)) * (-sinYaw) + (jz - (src.z + 0.5)) * cosYaw;
+                            if (jtf > MAX_FWD_POS) continue;
+                            double simJumpFwd = jtf;
+                            double simJumpLat = (jx - (src.x + 0.5)) *  cosYaw
+                                    + (jz - (src.z + 0.5)) * sinYaw;
+
+                            double[] air = simulateAirborne(
+                                    context, gx, gz, gv, groundAccel,
+                                    context.jumpBoostLevel, isSprint);
+                            if (air == null) continue;
+
+                            boolean landed = (air[0] > 0);
+                            double  lx     = air[1];
+                            double  lz     = air[2];
+
+                            double ldx   = lx - destCx;
+                            double ldz   = lz - destCz;
+                            double err   = Math.sqrt(ldx * ldx + ldz * ldz);
+
+                            boolean better = false;
+                            if (landed && !bestSuccess) {
+                                better = true;
+                            } else if (landed == bestSuccess && err < bestScoreErr) {
+                                better = true;
+                            }
+
+                            if (better) {
+                                bestSuccess = landed;
+                                bestScoreErr = err;
+                                bestN = N;
+                                bestFwd = startFwd;
+                                bestLat = lat;
+                                bestSprint = isSprint;
+                                bestJumpFwd = simJumpFwd;
+                                bestJumpLat = simJumpLat;
+                                HELPER.logDebug(String.format(
+                                        "[Parkour] NEW BEST bestSuccess=%s err=%.4f src=%s → dest=%s dist=%.2f dy=%d mode=%s N=%d startFwd=%.3f startLat=%.3f jumpTrigFwd=%.4f jumpTrigLat=%.4f",
+                                        bestSuccess, err, src, dest, horizDist, dy,
+                                        bestSprint ? "SPRINT" : "walk",
+                                        bestN, bestFwd, bestLat, simJumpFwd, simJumpLat));
+                            }
+                        }
+                    }
+                }
             }
         }
-        return set;
+
+        if (bestN == Integer.MAX_VALUE || !bestSuccess) {
+            if (DEBUG && DEBUG_COST) {
+                HELPER.logDebug(String.format("[Parkour] NO PLAN src=%s → dest=%s dist=%.2f dy=%d",
+                        src, dest, horizDist, dy));
+            }
+            return COST_INF;
+        }
+
+        this.startFwdOffset  = bestFwd;
+        this.startLatOffset  = bestLat;
+        this.bestIsSprint    = bestSprint;
+        this.bestN           = bestN;
+        this.jumpTriggerFwd  = bestJumpFwd;
+        this.jumpTriggerLat  = bestJumpLat;
+
+        double cost = bestN + horizDist * 2;
+        if (DEBUG && DEBUG_COST) {
+            HELPER.logDebug(String.format(
+                    "[Parkour] PLAN src=%s → dest=%s dist=%.2f dy=%d mode=%s N=%d startFwd=%.3f startLat=%.3f jumpTrigFwd=%.4f jumpTrigLat=%.4f cost=%.2f",
+                    src, dest, horizDist, dy,
+                    bestSprint ? "SPRINT" : "walk",
+                    bestN, bestFwd, bestLat,
+                    bestJumpFwd, bestJumpLat, cost));
+        }
+        return cost;
     }
 
-    @Override
-    public boolean safeToCancel(MovementState state) {
-        return state.getStatus() != MovementStatus.RUNNING;
+    private static double snapToExact(double v) {
+        if (Math.abs(v) < 1e-10) return 0.0;
+        if (Math.abs(v - 1.0) < 1e-10) return 1.0;
+        if (Math.abs(v + 1.0) < 1e-10) return -1.0;
+        return v;
     }
+
+    // =========================================================================
+    //  Airborne simulation — exact port of Python simulate_airborne
+    // =========================================================================
+
+    /**
+     * Simulates the player from (gx, src.y, gz) through the jump tick and then
+     * airborne, matching the Python apply_jump_tick + simulate_airborne exactly.
+     *
+     * apply_jump_tick (one extra ground tick before becoming airborne):
+     *   gv_launch = gv * GROUND_F + groundAccel
+     *   jx = gx + gv_launch * (-sinYaw)
+     *   jz = gz + gv_launch *   cosYaw
+     *   vx = (gv_launch + h_boost) * (-sinYaw)    // h_boost = SPRINT_JUMP_BOOST if sprint
+     *   vz = (gv_launch + h_boost) *   cosYaw
+     *   vy = JUMP_VELOCITY + jumpBoost * INCREMENT
+     *
+     * simulate_airborne tick order:
+     *   1. vx += airAccel*(-sinYaw); vz += airAccel*cosYaw
+     *   2. nx = x+vx; ny = y+vy; nz = z+vz
+     *   3. landing check: y>=landY && ny<=landY
+     *      → interpolate exact crossing: lx = x + f*(nx-x), lz = z + f*(nz-z)
+     *      → if [lx,lz] in [dest-PAD, dest+1+PAD] → SUCCESS
+     *      → if ny < landY-0.5 → bail
+     *   4. x=nx; y=ny; z=nz
+     *   5. vx*=AIR_DRAG; vz*=AIR_DRAG; vy=(vy-GRAVITY)*VERTICAL_DRAG
+     *   6. if |vy|<0.005 → vy=0
+     *   7. early exit if y < landY-2
+     *
+     * @param gx          player X after N ground ticks (pre-jump-tick)
+     * @param gz          player Z after N ground ticks (pre-jump-tick)
+     * @param gv          ground speed scalar after N ground ticks (pre-jump-tick)
+     * @param groundAccel ground acceleration for current mode (sprint/walk)
+     * @param jumpBoostLevel Jump Boost potion level (0 = none)
+     * @param isSprint    whether sprint physics apply
+     * @return double[]{successFlag, landX, landZ, ticks} or null if landing plane never reached
+     */
+    private double[] simulateAirborne(CalculationContext context,
+                                      double gx, double gz,
+                                      double gv,
+                                      double groundAccel,
+                                      int jumpBoostLevel,
+                                      boolean isSprint) {
+        double landY    = (double) dest.y;
+        double landMinX = dest.x - LAND_PAD;
+        double landMaxX = dest.x + 1.0 + LAND_PAD;
+        double landMinZ = dest.z - LAND_PAD;
+        double landMaxZ = dest.z + 1.0 + LAND_PAD;
+
+        double jumpHBoost = isSprint ? SPRINT_JUMP_BOOST : 0.0;
+        double airAccel   = isSprint ? AIR_ACCEL_SPRINT  : AIR_ACCEL_WALK;
+
+        // ── apply_jump_tick: one more ground tick then jump ──────────────────────
+        // MC order: accel first, pos advances by pre-friction speed, then friction stored.
+        // Sprint boost added separately after friction (jumpFromGround addDeltaMovement).
+        double vMidJump = gv + groundAccel;                  // pre-friction speed
+        double jx = gx + vMidJump * (-sinYaw);               // pos advances by pre-friction
+        double jz = gz + vMidJump *   cosYaw;
+        double gvLaunch = vMidJump * GROUND_F + jumpHBoost;  // stored deltaMovement + sprint boost
+
+        double vx = gvLaunch * (-sinYaw);
+        double vz = gvLaunch *   cosYaw;
+
+        // Guard: if the jump tick pushes us off the source block, skip this combo.
+        double jtf = (jx - (src.x + 0.5)) * (-sinYaw) + (jz - (src.z + 0.5)) * cosYaw;
+        if (jtf > MAX_FWD_POS) return null;
+
+
+        double vy = JUMP_VELOCITY + jumpBoostLevel * JUMP_BOOST_INCREMENT;
+
+        double x = jx, y = (double) src.y, z = jz;
+
+        if (DEBUG && DEBUG_AIR_TICKS) {
+            HELPER.logDebug(String.format("[Parkour][air] START  pos=(%.4f,%d,%.4f) gv=%.4f groundAccel=%.4f jumpBoost=%d",
+                    gx, src.y, gz, gv, groundAccel, jumpBoostLevel));
+        }
+
+        for (int tick = 0; tick < MAX_AIR_TICKS; tick++) {
+
+            // Step 1: Air acceleration
+            vx += airAccel * (-sinYaw);
+            vz += airAccel *   cosYaw;
+
+            // Step 2: Candidate next position
+            double nx = x + vx;
+            double ny = y + vy;
+            double nz = z + vz;
+
+            double nxMin = nx - PLAYER_WIDTH/2, nxMax = nx + PLAYER_WIDTH/2;
+            double nzMin = nz - PLAYER_WIDTH/2, nzMax = nz + PLAYER_WIDTH/2;
+            double pxMin =  x - PLAYER_WIDTH/2, pxMax =  x + PLAYER_WIDTH/2;
+            double pzMin =  z - PLAYER_WIDTH/2, pzMax =  z + PLAYER_WIDTH/2;
+
+            // Step 2b: Obstruction check (swept AABB — catches diagonal corners)
+            if (collidesWithBlocks(context, x, y, z, nx, ny, nz, tick)) {
+                HELPER.logDebug(String.format("[Parkour][air] TICK %2d  COLLISION at (%.4f,%.4f,%.4f) → (%.4f,%.4f,%.4f), aborting sim",
+                        tick, x, y, z, nx, ny, nz));
+                return new double[]{0.0, nx, nz, tick + 1};
+            }
+
+
+            if (DEBUG && DEBUG_AIR_TICKS) {
+                HELPER.logDebug(String.format("[Parkour][air] TICK %2d  pos=(%.4f,%.4f,%.4f) vel=(%.4f,%.4f,%.4f) → candidate=(%.4f,%.4f,%.4f)",
+                        tick, x, y, z, vx, vy, vz, nx, ny, nz));
+            }
+
+            // Step 3: Will-cross landing check with Y-interpolation (matches Python).
+            if (y >= landY && ny <= landY) {
+                double f  = (y != ny) ? (y - landY) / (y - ny) : 0.0;
+                double lx = x + f * (nx - x);
+                double lz = z + f * (nz - z);
+
+                boolean inBounds = lx >= landMinX && lx <= landMaxX && lz >= landMinZ && lz <= landMaxZ;
+                if (DEBUG && DEBUG_AIR_TICKS) {
+                    HELPER.logDebug(String.format("[Parkour][air]   tick=%2d  WILL-CROSS  f=%.4f  land=(%.4f,%.4f)  bounds=[%.2f..%.2f, %.2f..%.2f]  inBounds=%s",
+                            tick, f, lx, lz,
+                            landMinX, landMaxX, landMinZ, landMaxZ, inBounds));
+                }
+
+                if (inBounds) {
+                    return new double[]{1.0, lx, lz, tick + 1};
+                }
+                if (ny < landY - 0.5) {
+                    if (DEBUG && DEBUG_AIR_TICKS) {
+                        HELPER.logDebug(String.format("[Parkour][air]   tick=%2d  FELL PAST  ny=%.4f landY=%.1f",
+                                tick, ny, landY));
+                    }
+                    HELPER.logDebug(String.format("[Parkour][air] TICK %2d  FELL PAST landing plane at Y=%.1f (ny=%.4f), aborting sim",
+                            tick, landY, ny));
+                    return new double[]{0.0, nx, nz, tick + 1};
+                }
+            }
+
+            // Step 4: Commit move
+            x = nx;
+            y = ny;
+            z = nz;
+
+            // Step 5 & 6: Drag, gravity, vy clamp
+            // On tick 0 the player is still on the ground when horizontal motion is
+            // processed — Minecraft applies ground friction (GROUND_F) not air drag.
+            vx *= AIR_DRAG;
+            vz *= AIR_DRAG;
+            vy  = (vy - GRAVITY) * VERTICAL_DRAG;
+            if (Math.abs(vy) < 0.005) vy = 0.0;
+
+            // Step 7: Early termination
+            if (y < landY - 2.0) {
+                //HELPER.logDebug(String.format("[Parkour][air] TICK %2d  TOO LOW  y=%.4f landY=%.1f, aborting sim",
+                //        tick, y, landY));
+                return new double[]{0.0, x, z, tick + 1};
+            }
+            if (y < -100) break;
+        }
+
+        return null;
+    }
+
+    private AABB makeAABB(double x, double y, double z) {
+        return new AABB(
+                x - PLAYER_WIDTH / 2.0,
+                y,
+                z - PLAYER_WIDTH / 2.0,
+                x + PLAYER_WIDTH / 2.0,
+                y + PLAYER_HEIGHT,
+                z + PLAYER_WIDTH / 2.0
+        );
+    }
+
+    private AABB sweptAABB(double x, double y, double z,
+                           double nx, double ny, double nz) {
+
+        double minX = Math.min(x, nx) - PLAYER_WIDTH / 2.0;
+        double maxX = Math.max(x, nx) + PLAYER_WIDTH / 2.0;
+
+        double minY = Math.min(y, ny);
+        double maxY = Math.max(y, ny) + PLAYER_HEIGHT;
+
+        double minZ = Math.min(z, nz) - PLAYER_WIDTH / 2.0;
+        double maxZ = Math.max(z, nz) + PLAYER_WIDTH / 2.0;
+
+        return new AABB(minX, minY, minZ, maxX, maxY, maxZ);
+    }
+
+    // =========================================================================
+    //  Block collision
+    // =========================================================================
+
+    private boolean collidesWithBlocks(CalculationContext context,
+                                       double x, double y, double z,
+                                       double nx, double ny, double nz,
+                                       int airTick) {
+        AABB box = sweptAABB(x, y, z, nx, ny, nz);
+
+        int x0 = Mth.floor(box.minX), x1 = Mth.floor(box.maxX);
+        int y0 = Mth.floor(box.minY), y1 = Mth.floor(box.maxY);
+        int z0 = Mth.floor(box.minZ), z1 = Mth.floor(box.maxZ);
+
+        for (int bx = x0; bx <= x1; bx++) {
+            for (int by = y0; by <= y1; by++) {
+                for (int bz = z0; bz <= z1; bz++) {
+                    if (bx == src.x && bz == src.z
+                        && (by == src.y - 1 || by == src.y || by == src.y + 1)) {
+                        continue;
+                    }
+                    if (bx == dest.x && bz == dest.z
+                            && (by == dest.y - 1 || by == dest.y || by == dest.y + 1)) {
+                        continue;
+                    }
+                    if (!MovementHelper.canWalkThrough(context, bx, by, bz)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // =========================================================================
+    //  Landing validity
+    // =========================================================================
+
+    private static boolean isValidLanding(CalculationContext context, int x, int y, int z) {
+        if (!MovementHelper.canWalkOn(context, x, y - 1, z))      return false;
+        if (!MovementHelper.canWalkThrough(context, x, y, z))     return false;
+        if (!MovementHelper.canWalkThrough(context, x, y + 1, z)) return false;
+        if (MovementHelper.isBottomSlab(context.get(x, y - 1, z))) {
+            return MovementHelper.canWalkThrough(context, x, y, z) &&
+                    MovementHelper.canWalkThrough(context, x, y + 1, z);
+        }
+        return true;
+    }
+
+    // =========================================================================
+    //  Static factory
+    // =========================================================================
+
+    public static MovementParkour cost(CalculationContext context, BetterBlockPos src, double yawRad, int dy) {
+        if (!context.allowParkour) return null;
+        if (dy < -1 || dy > 1)    return null;
+
+        double sin = Math.sin(yawRad);
+        double cos = Math.cos(yawRad);
+
+        for (int dist = 5; dist >= 1; dist--) {
+            int destX = src.x - (int) Math.round(sin * dist);
+            int destZ = src.z + (int) Math.round(cos * dist);
+            int destY = src.y + dy;
+
+            if (destY < context.world.getMinY() || destY > context.world.getMaxY()) continue;
+            if (!context.bsi.worldContainsLoadedChunk(destX, destZ))               continue;
+            if (!isValidLanding(context, destX, destY, destZ))                     continue;
+            if (dy == 1 && !MovementHelper.canWalkThrough(context, destX, destY + 1, destZ)) continue;
+
+            MovementParkour m = new MovementParkour(
+                    context.getBaritone(), src, new BetterBlockPos(destX, destY, destZ));
+            double c = m.calculateCost(context);
+            if (c < COST_INF) {
+                m.override(c);
+                return m;
+            }
+        }
+        return null;
+    }
+
+    // =========================================================================
+    //  Runtime execution
+    // =========================================================================
 
     @Override
     public MovementState updateState(MovementState state) {
         super.updateState(state);
         if (state.getStatus() != MovementStatus.RUNNING) return state;
-
-        // Failure condition: fallen below start
-        if (ctx.playerFeet().y < src.y - 1) {
-            logDebug("Parkour failed: player fell");
-            debugParkour("FAIL: fell below start (" + ctx.playerFeet() + ") from (" + src + ")");
-            return state.setStatus(MovementStatus.UNREACHABLE);
+        if (ctx.playerFeet().equals(dest)) {
+            if (DEBUG && DEBUG_PHASES) {
+                HELPER.logDebug(String.format("[Parkour][SUCCESS] src=%s → dest=%s  airborne ticks=%d",
+                        src, dest, airborneTimer));
+            }
+            return state.setStatus(MovementStatus.SUCCESS);
         }
 
-        // Enable sprint for long/ascending jumps
-        if (requiresSprint) state.setInput(Input.SPRINT, true);
+        float jumpYaw = (float) Math.toDegrees(yawRad);
+        float currentYaw = ctx.playerRotations().getYaw();
 
-        // Magma block handling
-        if (Baritone.settings().allowWalkOnMagmaBlocks.value &&
-                ctx.world().getBlockState(ctx.playerFeet().below()).is(Blocks.MAGMA_BLOCK)) {
-            state.setInput(Input.SNEAK, true);
+        if (Float.isNaN(settledYaw)) {
+            // Tick 1: issue target
+            state.setTarget(new MovementState.MovementTarget(
+                    new Rotation(jumpYaw, ctx.playerRotations().getPitch()), true));
+            settledYaw = YAW_ISSUED_SENTINEL;
+        } else if (settledYaw == YAW_ISSUED_SENTINEL) {
+            // Tick 2: read back what engine produced
+            settledYaw = currentYaw;
+            state.setTarget(new MovementState.MovementTarget(
+                    new Rotation(settledYaw, ctx.playerRotations().getPitch()), true));
+        } else {
+            if (Math.abs(settledYaw - currentYaw) > YAW_PACKET_EPSILON_DEGREES) {
+                settledYaw = Float.NaN;
+                state.setTarget(new MovementState.MovementTarget(
+                        new Rotation(jumpYaw, ctx.playerRotations().getPitch()), true));
+            }
         }
 
-        // --- VELOCITY / RUNUP CHECK ---
-        // Back up along jump angle until we reach the physics-simulated backup target.
-        // Compute backup target once and cache it.
-        if (!backupDone && ctx.playerFeet().equals(src) && ctx.player().onGround()) {
-            if (needsRunup()) {
-                // Compute and cache backup target on first call
-                if (cachedBackupTarget == null) {
-                    cachedBackupTarget = computeBackupTarget();
+        // Project the player's actual world position onto the src-relative
+        // forward/lateral axes — the same coordinate frame the sim uses.
+        double px      = ctx.player().position().x - (src.x + 0.5);
+        double pz      = ctx.player().position().z - (src.z + 0.5);
+        double projFwd = px * (-sinYaw) + pz *  cosYaw;
+        double projLat = px *   cosYaw  + pz *  sinYaw;
+
+        switch (phase) {
+
+            case BACK_UP: {
+                // Seed lastSettleFwd on the very first tick so posDelta is meaningful.
+                if (settleTimer == 0) {
+                    lastSettleFwd = projFwd;
+                    settleTimer   = 1;
                 }
-                if (cachedBackupTarget != null) {
-                    double sin = Math.sin(angleRad), cos = Math.cos(angleRad);
 
-                    // Move backwards towards the precise backup target along the angle
-                    state.setTarget(new MovementState.MovementTarget(
-                            RotationUtils.calcRotationFromVec3d(ctx.playerHead(),
-                                    cachedBackupTarget,
-                                    ctx.playerRotations()),
-                            true
-                    )).setInput(Input.MOVE_BACK, true);
+                boolean fwdOk = Math.abs(projFwd - startFwdOffset) <= 0.06;
+                boolean latOk = Math.abs(projLat - startLatOffset) <= 0.06;
 
-                    // Check if we've reached/passed the target along the jump axis (Minecraft: dx = -sin, dz = cos)
-                    double toTargetX = cachedBackupTarget.x - ctx.player().position().x;
-                    double toTargetZ = cachedBackupTarget.z - ctx.player().position().z;
-                    double toTargetAlongAngle = -toTargetX * sin + toTargetZ * cos;
-                    if (toTargetAlongAngle <= 0.02) {
-                        backupDone = true;
-                        logDebug("Backup completed, ready to jump");
+                double posDelta = projFwd - lastSettleFwd;
+                lastSettleFwd = projFwd;
+
+                if (fwdOk && latOk) {
+                    if (posDelta < 0.06) {
+                        runupTick = 0;
+                        phase = Phase.RUN_UP;
+                        if (DEBUG && DEBUG_PHASES) {
+                            HELPER.logDebug(String.format("[Parkour][BACK_UP] DONE  projFwd=%.4f (target=%.3f)  delta=%.5f",
+                                    projFwd, startFwdOffset, posDelta));
+                        }
+                    } else {
+                        // In position but still moving — dampen based on direction
+                        if (posDelta < 0) {
+                            // Moving backwards — apply just a tiny forward to slow it but keep it drifting back
+                            // i.e. do nothing, let drag handle it — we WANT slight backward drift
+                        } else {
+                            // Moving forwards — fight it back hard
+                            state.setInput(Input.MOVE_BACK, true);
+                        }
                     }
-
-                    logDebug("Backing up for run-up: target=" + cachedBackupTarget + " toTargetAlongAngle=" + toTargetAlongAngle);
-                    debugParkour("BACKUP: target=" + cachedBackupTarget + " toTargetAlongAngle=" + toTargetAlongAngle);
                 } else {
-                    // Already have enough speed, skip backup
-                    backupDone = true;
+                    // Not in position yet — continuous move toward target
+                    if (projFwd > startFwdOffset + 0.06) {
+                        state.setInput(Input.MOVE_BACK, true);
+                    } else if (projFwd < startFwdOffset - 0.06) {
+                        state.setInput(Input.MOVE_FORWARD, true);
+                    }
+                    if (projLat < startLatOffset - 0.06) state.setInput(Input.MOVE_LEFT,  true);
+                    else if (projLat > startLatOffset + 0.06) state.setInput(Input.MOVE_RIGHT, true);
                 }
-                return state;
+                break;
             }
-        }
 
-        // Navigate towards destination
-        logDebug("Navigating towards destination: " + dest);
-        MovementHelper.moveTowards(ctx, state, dest);
+            case RUN_UP: {
+                if (bestIsSprint) state.setInput(Input.SPRINT, true);
+                state.setInput(Input.MOVE_FORWARD, true);
 
-        // Jump trigger: Euclidean distance from source block center, threshold 0.85
-        if (!ctx.playerFeet().equals(src) && !ctx.playerFeet().equals(dest)) {
-            double px = ctx.player().position().x - (src.x + 0.5);
-            double pz = ctx.player().position().z - (src.z + 0.5);
-            double movedDist = Math.hypot(px, pz);
-
-            // Trigger jump after moving 0.85 blocks from block center (matches simulation)
-            // OR when player starts ascending (already airborne)
-            if (movedDist > 0.85 || ctx.player().position().y > src.y + 0.01) {
-                // Mid-air block placement fallback
-                if (Baritone.settings().allowPlace.value &&
-                        !ctx.player().onGround() &&
-                        !MovementHelper.canWalkOn(ctx, dest.below()) &&
-                        ((Baritone) baritone).getInventoryBehavior().hasGenericThrowaway()) {
-                    var result = MovementHelper.attemptToPlaceABlock(state, baritone, dest.below(), true, false);
-                    if (result == PlaceResult.READY_TO_PLACE) {
-                        state.setInput(Input.CLICK_RIGHT, true);
-                        logDebug("Attempting mid-air block placement at " + dest.below());
-                        debugParkour("FALLBACK: mid-air block placement at " + dest.below());
+                // CHECK position FIRST — before any movement this tick.
+                // This makes N=0 (jump from standing start) fire immediately,
+                // and N>0 fire after exactly N ground ticks, matching the sim.
+                if (projFwd >= jumpTriggerFwd) {
+                    if (DEBUG && DEBUG_PHASES) {
+                        HELPER.logDebug(String.format("[Parkour][RUN_UP]  JUMP TRIGGERED  projFwd=%.4f >= jumpTrigFwd=%.4f  projLat=%.4f (jumpTrigLat=%.4f)",
+                                projFwd, jumpTriggerFwd, projLat, jumpTriggerLat));
+                        // print all the calculateCost info
+                        HELPER.logDebug(String.format("[Parkour][RUN_UP]  src=%s dest=%s  startFwd=%.3f startLat=%.3f  jumpTrigFwd=%.4f jumpTrigLat=%.4f bestN=%d  sprint=%s",
+                                src, dest, startFwdOffset, startLatOffset, jumpTriggerFwd, jumpTriggerLat, bestN, bestIsSprint ? "YES" : "no"));
+                    }
+                    state.setInput(Input.JUMP, true);
+                    phase = Phase.AIRBORNE;
+                    airborneTimer = 0;
+                } else {
+                    if (DEBUG && DEBUG_RUNUP) {
+                        HELPER.logDebug(String.format("[Parkour][RUN_UP]  tick %d  projFwd=%.4f (target=%.4f)  projLat=%.4f (target=%.3f)",
+                                runupTick, projFwd, jumpTriggerFwd, projLat, jumpTriggerLat));
                     }
                 }
-                state.setInput(Input.JUMP, true);
-                debugParkour("JUMP: triggered at (" + ctx.player().position() + ") from (" + src + ") to (" + dest + ") movedDist=" + movedDist);
+                // If not triggered, the game engine advances the player this tick
+                // (MOVE_FORWARD is already set above), so next call projFwd will be higher.
+                break;
             }
-        }
 
-        // Success: jump completed - player landed on ground within ~1 block of expected destination.
-        // Euclidean distance tolerance accounts for physics + collision variance.
-        BetterBlockPos playerFeet = ctx.playerFeet();
-        if (ctx.player().onGround() && !playerFeet.equals(src)) {
-            double dx = playerFeet.x + 0.5 - (dest.x + 0.5);
-            double dy = playerFeet.y - dest.y;
-            double dz = playerFeet.z + 0.5 - (dest.z + 0.5);
-            if (Math.sqrt(dx*dx + dy*dy + dz*dz) <= 1.0) {
-                logDebug("Parkour successful: landed at " + playerFeet + " (target was " + dest + ")");
-                debugParkour("SUCCESS: landed within 1 block of " + dest + " at " + playerFeet);
-                return state.setStatus(MovementStatus.SUCCESS);
+            case AIRBORNE: {
+                if (bestIsSprint) state.setInput(Input.SPRINT, true);
+                state.setInput(Input.MOVE_FORWARD, true);
+                airborneTimer++;
+                if (DEBUG && DEBUG_PHASES) {
+                    HELPER.logDebug(String.format("[Parkour][AIRBORNE]  tick %d  projFwd=%.4f (jumpTrigFwd=%.4f)  projLat=%.4f (jumpTrigLat=%.4f)  playerPos=(%.4f,%.4f,%.4f)  feetY=%d",
+                            airborneTimer, projFwd, jumpTriggerFwd, projLat, jumpTriggerLat,
+                            ctx.player().position().x, ctx.player().position().y, ctx.player().position().z,
+                            ctx.playerFeet().y));
+                }
+                if (airborneTimer > 80) {
+                    if (DEBUG && DEBUG_PHASES) {
+                        HELPER.logDebug(String.format("[Parkour][AIRBORNE] TIMEOUT after %d ticks — UNREACHABLE  src=%s dest=%s",
+                                airborneTimer, src, dest));
+                    }
+                    return state.setStatus(MovementStatus.UNREACHABLE);
+                }
+                break;
             }
         }
 
         return state;
     }
 
-    /**
-     * Returns true if the player's current horizontal velocity projected onto the jump
-     * direction is below the minimum needed to make this jump with a normal run-up.
-     */
-    private boolean needsRunup() {
-        double sin = Math.sin(angleRad);
-        double cos = Math.cos(angleRad);
-        // Project current velocity onto jump axis (Minecraft: dx = -sin, dz = cos)
-        double vx = ctx.player().getDeltaMovement().x;
-        double vz = ctx.player().getDeltaMovement().z;
-        double projectedSpeed = -vx * sin + vz * cos;
-        return projectedSpeed < MIN_JUMP_SPEED;
-    }
+    // =========================================================================
+    //  Boilerplate
+    // =========================================================================
 
-    /**
-     * Compute the precise backup target (Vec3) so the player backs up exactly
-     * enough along the jump angle to reach MIN_JUMP_SPEED at takeoff.
-     *
-     * Uses the same physics simulation as the trajectory predictor.
-     * Returns null if no backup is needed (player already has enough speed).
-     */
-    private net.minecraft.world.phys.Vec3 computeBackupTarget() {
-        double sin = Math.sin(angleRad), cos = Math.cos(angleRad);
-
-        // Project velocity onto jump axis (Minecraft: dx = -sin, dz = cos)
-        double vx = ctx.player().getDeltaMovement().x;
-        double vz = ctx.player().getDeltaMovement().z;
-        double speed = -vx * sin + vz * cos;
-
-        if (speed >= MIN_JUMP_SPEED) return null;
-
-        // Simulate acceleration to MIN_JUMP_SPEED
-        final double groundDrag = 0.546, groundAccel = 0.13;
-        double runupDist = 0.0;
-        for (int t = 0; t < 40 && speed < MIN_JUMP_SPEED; t++) {
-            speed = speed * groundDrag + groundAccel;
-            runupDist += speed;
+    @Override
+    protected Set<BetterBlockPos> calculateValidPositions() {
+        Set<BetterBlockPos> set = new HashSet<>();
+        set.add(src);
+        set.add(dest);
+        for (int i = 0; i <= (int) horizDist; i++) {
+            int cx = src.x + (int) Math.round(dx * i / horizDist);
+            int cz = src.z + (int) Math.round(dz * i / horizDist);
+            set.add(new BetterBlockPos(cx, src.y, cz));
+            set.add(new BetterBlockPos(cx, src.y + 1, cz));
+        }
+        for (double fwd = START_SWEEP_MIN - 1.0; fwd <= START_SWEEP_MAX + 1e-9; fwd += START_SWEEP_STEP) {
+            for (double lat = -MAX_LATERAL_OFFSET; lat <= MAX_LATERAL_OFFSET + 1e-9; lat += LATERAL_SWEEP_STEP) {
+                double px = src.x + 0.5 + fwd * (-sinYaw) + lat * cosYaw;
+                double pz = src.z + 0.5 + fwd *  cosYaw   + lat * sinYaw;
+                int bx = (int) Math.floor(px);
+                int bz = (int) Math.floor(pz);
+                set.add(new BetterBlockPos(bx, src.y, bz));
+                set.add(new BetterBlockPos(bx, src.y + 1, bz));
+            }
         }
 
-        double backDist = Math.min(runupDist, 0.8);
-
-        // Angle-aware exit offset (cardinal=0.2, 45°≈0.28)
-        double cardinalness = Math.max(Math.abs(sin), Math.abs(cos));
-        double exitOffset = 0.2 + 0.08 * (1.0 - cardinalness);
-
-        // Compute target: takeoff point minus run-up distance along the angle
-        // Minecraft forward vector: dx = -sin(yaw), dz = cos(yaw)
-        double targetX = (src.x + 0.5) - sin * (exitOffset - backDist);
-        double targetZ = (src.z + 0.5) + cos * (exitOffset - backDist);
-
-        // Clamp to stay within source block
-        targetX = Math.clamp(targetX, src.x + 0.1, src.x + 0.9);
-        targetZ = Math.clamp(targetZ, src.z + 0.1, src.z + 0.9);
-
-        return new net.minecraft.world.phys.Vec3(targetX, src.y, targetZ);
+        return set;
     }
 
-    // In MovementParkour class:
-    public double getAngleRad() {
-        return angleRad;
+    @Override
+    public void reset() {
+        super.reset();
+        phase         = Phase.BACK_UP;
+        settleTimer   = 0;
+        airborneTimer = 0;
+        this.startFwdOffset  = 0;
+        this.startLatOffset  = 0;
+        this.bestIsSprint    = false;
+        this.bestN           = Integer.MAX_VALUE;
+        this.jumpTriggerFwd  = Double.MAX_VALUE;
+        this.jumpTriggerLat  = 0;
+        runupTick = 0;
+        settledYaw = Float.NaN;
+        lastInputWasForward = false;
+        lastSettleFwd = 0.0;
     }
 
-    public int getVertOffset() {
-        return vertDelta;
-    }
-
-    // Helper for parkour debug telemetry
-    private static void debugParkour(String msg) {
-        if (Baritone.settings().parkourDebugTelemetry.value) {
-            HELPER.logDebug("[ParkourTelemetry] " + msg);
-        }
+    @Override
+    public boolean safeToCancel(MovementState state) {
+        return false;
     }
 }
-

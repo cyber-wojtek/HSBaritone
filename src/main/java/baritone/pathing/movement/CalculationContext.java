@@ -20,6 +20,7 @@ package baritone.pathing.movement;
 import baritone.Baritone;
 import baritone.api.IBaritone;
 import baritone.api.pathing.movement.ActionCosts;
+import baritone.behavior.SkyblockTransportBehavior;
 import baritone.cache.WorldData;
 import baritone.pathing.precompute.PrecomputedData;
 import baritone.utils.BlockStateInterface;
@@ -41,6 +42,10 @@ import net.minecraft.world.level.block.state.BlockState;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
+
+import net.minecraft.world.effect.MobEffects;
+import net.minecraft.world.effect.MobEffectInstance;
 
 import static baritone.api.pathing.movement.ActionCosts.COST_INF;
 
@@ -84,6 +89,17 @@ public class CalculationContext {
     public final double walkOnWaterOnePenalty;
     public final boolean allowWalkOnMagmaBlocks;
     public final BetterWorldBorder worldBorder;
+    public final boolean skyblockTransportEnabled;
+    public final int skyblockMana;
+    public final boolean skyblockHasInstantTransmissionItem;
+    public final boolean skyblockHasAoteOrAotv;
+    public final boolean skyblockHasAotv;
+    public final boolean skyblockHasManaBoots;
+    public final boolean allowSkyblockInstantTransmission;
+    public final boolean allowSkyblockEtherTransmission;
+    public final boolean allowSkyblockDoubleJump;
+    public final int jumpBoostLevel;
+    public final double playerMovementSpeed;
 
     public final PrecomputedData precomputedData;
 
@@ -92,6 +108,10 @@ public class CalculationContext {
     }
 
     public CalculationContext(IBaritone baritone, boolean forUseOnAnotherThread) {
+        this(baritone, forUseOnAnotherThread, true, true, true);
+    }
+
+    public CalculationContext(IBaritone baritone, boolean forUseOnAnotherThread, boolean allowSkyblockInstantTransmission, boolean allowSkyblockEtherTransmission, boolean allowSkyblockDoubleJump) {
         this.precomputedData = new PrecomputedData();
         this.safeForThreadedUse = forUseOnAnotherThread;
         this.baritone = baritone;
@@ -100,8 +120,8 @@ public class CalculationContext {
         this.worldData = (WorldData) baritone.getPlayerContext().worldData();
         this.bsi = new BlockStateInterface(baritone.getPlayerContext(), forUseOnAnotherThread);
         this.toolSet = new ToolSet(player);
-        this.hasThrowaway = Baritone.settings().allowPlace.value && ((Baritone) baritone).getInventoryBehavior().hasGenericThrowaway();
-        this.hasWaterBucket = Baritone.settings().allowWaterBucketFall.value && Inventory.isHotbarSlot(player.getInventory().findSlotMatchingItem(STACK_BUCKET_WATER)) && world.dimension() != Level.NETHER;
+        this.hasThrowaway = Baritone.settings().allowPlace.value && Baritone.settings().allowInteract.value && ((Baritone) baritone).getInventoryBehavior().hasGenericThrowaway();
+        this.hasWaterBucket = Baritone.settings().allowInteract.value && Baritone.settings().allowWaterBucketFall.value && Inventory.isHotbarSlot(player.getInventory().findSlotMatchingItem(STACK_BUCKET_WATER)) && world.dimension() != Level.NETHER;
         this.canSprint = Baritone.settings().allowSprint.value && player.getFoodData().getFoodLevel() > 6;
         this.placeBlockCost = Baritone.settings().blockPlacementPenalty.value;
         this.allowBreak = Baritone.settings().allowBreak.value;
@@ -111,6 +131,7 @@ public class CalculationContext {
         this.allowJumpAtBuildLimit = Baritone.settings().allowJumpAtBuildLimit.value;
         this.allowParkourAscend = Baritone.settings().allowParkourAscend.value;
         this.assumeWalkOnWater = Baritone.settings().assumeWalkOnWater.value;
+        this.jumpBoostLevel = Baritone.settings().jumpBoostLevel.value;
         this.allowFallIntoLava = false; // Super secret internal setting for ElytraBehavior
         // todo: technically there can now be datapack enchants that replace blocks with any other at any range
         int frostWalkerLevel = 0;
@@ -155,6 +176,39 @@ public class CalculationContext {
         this.jumpPenalty = Baritone.settings().jumpPenalty.value;
         this.walkOnWaterOnePenalty = Baritone.settings().walkOnWaterOnePenalty.value;
         this.allowWalkOnMagmaBlocks = Baritone.settings().allowWalkOnMagmaBlocks.value;
+        this.skyblockTransportEnabled = Baritone.settings().skyblockTransportEnabled.value;
+        SkyblockTransportBehavior skyblockBehavior = baritone instanceof Baritone ? ((Baritone) baritone).getSkyblockTransportBehavior() : null;
+        this.skyblockMana = skyblockBehavior == null ? -1 : skyblockBehavior.getEstimatedMana();
+
+        boolean foundAotv = false;
+        boolean foundAote = false;
+        for (int i = 0; i < 9; i++) {
+            String name = player.getInventory().getNonEquipmentItems().get(i).getHoverName().getString().toLowerCase(Locale.ROOT);
+            if (name.contains("aspect of the void")) {
+                foundAotv = true;
+            }
+            if (name.contains("aspect of the end")) {
+                foundAote = true;
+            }
+        }
+        this.skyblockHasAotv = foundAotv;
+        this.skyblockHasInstantTransmissionItem = foundAotv || foundAote;
+        this.skyblockHasAoteOrAotv = this.skyblockHasInstantTransmissionItem;
+        this.allowSkyblockInstantTransmission = allowSkyblockInstantTransmission;
+        this.allowSkyblockEtherTransmission = allowSkyblockEtherTransmission;
+        this.allowSkyblockDoubleJump = allowSkyblockDoubleJump;
+
+        String bootsName = player.getItemBySlot(EquipmentSlot.FEET).getHoverName().getString().toLowerCase(Locale.ROOT);
+        this.skyblockHasManaBoots = bootsName.contains("spider's boots")
+                || bootsName.contains("tarantula boots")
+                || bootsName.contains("primordial boots");
+        double baseMovementSpeed = player.getAttributes().getBaseValue(Attributes.MOVEMENT_SPEED);
+        net.minecraft.world.effect.MobEffectInstance speedEffect = player.getEffect(
+            net.minecraft.world.effect.MobEffects.SPEED);
+        if (speedEffect != null) {
+            baseMovementSpeed *= (1 + 0.2 * (speedEffect.getAmplifier() + 1));
+        }
+        this.playerMovementSpeed = baseMovementSpeed;
         // why cache these things here, why not let the movements just get directly from settings?
         // because if some movements are calculated one way and others are calculated another way,
         // then you get a wildly inconsistent path that isn't optimal for either scenario.

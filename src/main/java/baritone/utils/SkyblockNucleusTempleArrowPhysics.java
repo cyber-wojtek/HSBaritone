@@ -82,31 +82,49 @@ public final class SkyblockNucleusTempleArrowPhysics {
     // =================================================================
 
     /**
-     * Check if any arrow entity is currently within danger distance of
-     * the player position.
+     * Find arrows fired from nearby dispensers. Returns the closest dispenser-spawned arrow
+     * to the player. Caller handles danger-radius filtering.
      *
-     * @param mc         Minecraft instance
-     * @param playerPos  player position to check
-     * @param dangerRadius radius in blocks to consider "dangerous"
-     * @return the closest arrow entity, or null if none found
+     * @param mc              Minecraft instance
+     * @param playerPos       player position (for distance sorting)
+     * @param dispenserPoses  known dispenser positions that could fire at player
+     * @param spawnTolerance  max distance from dispenser to consider arrow as "just fired"
+     * @return the closest arrow entity from a dispenser, or null if none found
      */
-    public static AbstractArrow findNearbyArrow(Minecraft mc, BlockPos playerPos, double dangerRadius) {
+    public static AbstractArrow findNearbyArrow(Minecraft mc, BlockPos playerPos,
+                                                Iterable<BlockPos> dispenserPoses, double spawnTolerance) {
         if (mc.level == null) return null;
 
         double px = playerPos.getX() + 0.5;
         double py = playerPos.getY() + 0.5;
         double pz = playerPos.getZ() + 0.5;
-        double maxDistSq = dangerRadius * dangerRadius;
 
         AbstractArrow closest = null;
-        double closestDistSq = maxDistSq;
+        double closestDistSq = Double.MAX_VALUE;
 
         for (net.minecraft.world.entity.Entity entity : mc.level.entitiesForRendering()) {
             if (entity instanceof AbstractArrow arrow) {
-                double dx = arrow.getX() - px;
-                double dy = arrow.getY() - py;
-                double dz = arrow.getZ() - pz;
-                double distSq = dx * dx + dy * dy + dz * dz;
+                // Skip stale arrows: velocity decayed from drag or stuck/picked up
+                var vel = arrow.getDeltaMovement();
+                if (vel.length() < 0.01) continue;
+
+                // Detect if arrow was just fired: check if position is near any dispenser
+                // Dispenser arrows spawn at dispenser face with ~3.0 blocks/tick initial velocity
+                boolean justFired = false;
+                for (BlockPos dispenser : dispenserPoses) {
+                    double dx = arrow.getX() - (dispenser.getX() + 0.5);
+                    double dy = arrow.getY() - (dispenser.getY() + 0.5);
+                    double dz = arrow.getZ() - (dispenser.getZ() + 0.5);
+                    if (dx*dx + dy*dy + dz*dz <= spawnTolerance * spawnTolerance) {
+                        justFired = true;
+                        break;
+                    }
+                }
+                if (!justFired) continue;
+
+                // Return closest dispenser-spawned arrow to player
+                double distSq = (arrow.getX() - px) * (arrow.getX() - px) +
+                                (arrow.getZ() - pz) * (arrow.getZ() - pz);
                 if (distSq < closestDistSq) {
                     closestDistSq = distSq;
                     closest = arrow;

@@ -21,6 +21,7 @@ import baritone.api.pathing.goals.Goal;
 import baritone.api.pathing.movement.ActionCosts;
 import baritone.api.utils.BetterBlockPos;
 import baritone.api.utils.SettingsUtil;
+import baritone.pathing.movement.Moves;
 
 /**
  * A node in the path, containing the cost and steps to get to it.
@@ -28,6 +29,13 @@ import baritone.api.utils.SettingsUtil;
  * @author leijurv
  */
 public final class PathNode {
+
+    public enum PreviousEdge {
+        NONE,
+        NORMAL_MOVE,
+        ETHERWARP_DYNAMIC,
+        PARKOUR_DYNAMIC,
+    }
 
     /**
      * The position of this node
@@ -59,6 +67,14 @@ public final class PathNode {
      */
     public PathNode previous;
 
+    public PreviousEdge previousEdge;
+
+    public Moves previousMove;
+
+    // In PathNode class fields:
+    public double parkourAngle = 0;           // Radians, 0 = +Z, clockwise
+    public int parkourVertOffset = 0;         // -2 to +2
+
     /**
      * Where is this node in the array flattenization of the binary heap? Needed for decrease-key operations.
      */
@@ -66,6 +82,8 @@ public final class PathNode {
 
     public PathNode(int x, int y, int z, Goal goal) {
         this.previous = null;
+        this.previousEdge = PreviousEdge.NONE;
+        this.previousMove = null;
         this.cost = ActionCosts.COST_INF;
         this.estimatedCostToGoal = goal.heuristic(x, y, z);
         if (Double.isNaN(estimatedCostToGoal)) {

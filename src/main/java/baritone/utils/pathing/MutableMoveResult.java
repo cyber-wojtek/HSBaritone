@@ -41,4 +41,18 @@ public final class MutableMoveResult {
         z = 0;
         cost = ActionCosts.COST_INF;
     }
+
+    public final void set(MutableMoveResult other) {
+        x = other.x;
+        y = other.y;
+        z = other.z;
+        cost = other.cost;
+    }
+
+    public final void set(int x, int y, int z, double cost) {
+        this.x = x;
+        this.y = y;
+        this.z = z;
+        this.cost = cost;
+    }
 }

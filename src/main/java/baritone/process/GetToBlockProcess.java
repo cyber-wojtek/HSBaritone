@@ -240,6 +240,9 @@ public final class GetToBlockProcess extends BaritoneProcessHelper implements IG
     }
 
     private boolean rightClickOnArrival(Block block) {
+        if (!Baritone.settings().allowInteract.value) {
+            return false;
+        }
         if (!Baritone.settings().rightClickContainerOnArrival.value) {
             return false;
         }

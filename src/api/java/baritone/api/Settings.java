@@ -78,6 +78,11 @@ public final class Settings {
     public final Setting<Boolean> allowPlace = new Setting<>(true);
 
     /**
+     * Allow Baritone to interact with blocks/items using right click (doors, containers, item abilities, fireworks, etc.).
+     */
+    public final Setting<Boolean> allowInteract = new Setting<>(true);
+
+    /**
      * Allow Baritone to place blocks in fluid source blocks
      */
     public final Setting<Boolean> allowPlaceInFluidsSource = new Setting<>(true);
@@ -134,6 +139,86 @@ public final class Settings {
      * Additional penalty for hitting the space bar (ascend, pillar, or parkour) because it uses hunger
      */
     public final Setting<Double> jumpPenalty = new Setting<>(2D);
+
+    /**
+     * Enables SkyBlock-specific movement abilities that consume mana (AOTE/AOTV and mana boots).
+     */
+    public final Setting<Boolean> skyblockTransportEnabled = new Setting<>(false);
+
+    /**
+     * How long (in ticks) parsed mana HUD data is considered fresh.
+     */
+    public final Setting<Integer> skyblockManaStaleTicks = new Setting<>(40);
+
+    /**
+     * Allow using Instant Transmission (regular right click) while pathing.
+     */
+    public final Setting<Boolean> skyblockInstantTransmissionEnabled = new Setting<>(true);
+
+    /**
+     * Mana cost used for Instant Transmission checks.
+     */
+    public final Setting<Integer> skyblockInstantTransmissionManaCost = new Setting<>(50);
+
+    /**
+     * Maximum teleport targeting distance for Instant Transmission.
+     */
+    public final Setting<Integer> skyblockInstantTransmissionRange = new Setting<>(12);
+
+    /**
+     * Minimum horizontal gain (blocks) required before using Instant Transmission.
+     */
+    public final Setting<Integer> skyblockInstantTransmissionMinGain = new Setting<>(6);
+
+    /**
+     * Allow using Ether Transmission (sneak + right click) while pathing.
+     */
+    public final Setting<Boolean> skyblockEtherTransmissionEnabled = new Setting<>(true);
+
+    /**
+     * Mana cost used for Ether Transmission checks.
+     */
+    public final Setting<Integer> skyblockEtherTransmissionManaCost = new Setting<>(180);
+
+    /**
+     * Maximum targeting distance for Ether Transmission.
+     */
+    public final Setting<Integer> skyblockEtherTransmissionRange = new Setting<>(57);
+
+    /**
+     * Minimum horizontal gain (blocks) required before using Ether Transmission.
+     */
+    public final Setting<Integer> skyblockEtherTransmissionMinGain = new Setting<>(10);
+
+    /**
+     * Allow using mana boots double jump while in air.
+     */
+    public final Setting<Boolean> skyblockDoubleJumpEnabled = new Setting<>(true);
+
+    /**
+     * When enabled in Skyblock Nucleus Temple, pathfinding will detect
+     * arrow-shooting traps and move immediately after arrow launch is detected,
+     * rather than waiting for a timer. This ensures passage through the trap
+     * zone before the next fire cycle.
+     */
+    public final Setting<Boolean> skyblockNucleusTempleTrapAvoidanceEnabled = new Setting<>(false);
+
+    /**
+     * How far ahead to scan for traps along the path in Nucleus Temple (blocks).
+     * Larger values catch traps earlier but increase computation cost.
+     */
+    public final Setting<Integer> skyblockNucleusTempleTrapDetectionRange = new Setting<>(30);
+
+    /**
+     * Safety margin in blocks added after arrow passes before proceeding.
+     * Ensures the arrow has fully cleared the player's path before moving forward.
+     */
+    public final Setting<Double> skyblockNucleusTempleSafetyMarginBlocks = new Setting<>(2.0);
+
+    /**
+     * Mana cost used for each mana-boots double jump check.
+     */
+    public final Setting<Integer> skyblockDoubleJumpManaCost = new Setting<>(50);
 
     /**
      * Walking on water uses up hunger really quick, so penalize it
@@ -367,6 +452,12 @@ public final class Settings {
      * Doesn't make it any more dangerous compared to just normal allowParkour th
      */
     public final Setting<Boolean> allowParkourPlace = new Setting<>(false);
+
+    /**
+     * Emit detailed parkour telemetry (runup, projected lip speed, required launch speed, jump decisions).
+     * Useful for tuning parkour behavior; noisy when enabled.
+     */
+    public final Setting<Boolean> parkourDebugTelemetry = new Setting<>(false);
 
     /**
      * For example, if you have Mining Fatigue or Haste, adjust the costs of breaking blocks accordingly.
@@ -1559,6 +1650,11 @@ public final class Settings {
     public final List<Setting<?>> allSettings;
 
     public final Map<Setting<?>, Type> settingTypes;
+
+    /**
+     * Jump boost level
+     */
+    public final Setting<Integer> jumpBoostLevel = new Setting<>(0);
 
     public final class Setting<T> {
 

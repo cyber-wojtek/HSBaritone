@@ -15,7 +15,7 @@
  * along with Baritone.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-package baritone.utils;
+package baritone.api.utils;
 
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;

@@ -23,6 +23,7 @@ import baritone.api.command.argument.IArgConsumer;
 import baritone.api.command.datatypes.RelativeCoordinate;
 import baritone.api.command.datatypes.RelativeGoal;
 import baritone.api.command.exception.CommandException;
+import baritone.api.command.exception.CommandInvalidStateException;
 import baritone.api.command.helpers.TabCompleteHelper;
 import baritone.api.pathing.goals.Goal;
 import baritone.api.process.ICustomGoalProcess;
@@ -41,7 +42,16 @@ public class GoalCommand extends Command {
     @Override
     public void execute(String label, IArgConsumer args) throws CommandException {
         ICustomGoalProcess goalProcess = baritone.getCustomGoalProcess();
-        if (args.hasAny() && Arrays.asList("reset", "clear", "none").contains(args.peekString())) {
+        if (args.hasAny() && "route".equalsIgnoreCase(args.peekString())) {
+            args.get();
+            RouteArgumentParser.ParsedRoute route = RouteArgumentParser.parseRoute(args, ctx.playerFeet());
+            List<Goal> goals = route.goals;
+            if (goals.size() < 2) {
+                throw new CommandInvalidStateException("Route mode requires at least 2 checkpoints");
+            }
+            goalProcess.setGoalAndPath(goals, route.noSkyblockAbilityRanges);
+            logDirect(String.format("Routing through %d checkpoints", goals.size()));
+        } else if (args.hasAny() && Arrays.asList("reset", "clear", "none").contains(args.peekString())) {
             args.requireMax(1);
             if (goalProcess.getGoal() != null) {
                 goalProcess.setGoal(null);
@@ -62,7 +72,10 @@ public class GoalCommand extends Command {
     public Stream<String> tabComplete(String label, IArgConsumer args) throws CommandException {
         TabCompleteHelper helper = new TabCompleteHelper();
         if (args.hasExactlyOne()) {
-            helper.append("reset", "clear", "none", "~");
+            helper.append("reset", "clear", "none", "route", "~");
+        } else if (args.hasAny() && "route".equalsIgnoreCase(args.peekString())) {
+            args.get();
+            return args.tabCompleteDatatype(RelativeCoordinate.INSTANCE);
         } else {
             if (args.hasAtMost(3)) {
                 while (args.has(2)) {
@@ -94,6 +107,8 @@ public class GoalCommand extends Command {
                 "Usage:",
                 "> goal - Set the goal to your current position",
                 "> goal <reset/clear/none> - Erase the goal",
+                "> goal route <x1> <y1> <z1> [;] <x2> <y2> <z2> ... - Path via ordered checkpoints",
+                "> goal route ... nosb <from-to[,from-to...]> - Disable SB abilities on checkpoint segment ranges",
                 "> goal <y> - Set the goal to a Y level",
                 "> goal <x> <z> - Set the goal to an X,Z position",
                 "> goal <x> <y> <z> - Set the goal to an X,Y,Z position"

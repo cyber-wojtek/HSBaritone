@@ -156,6 +156,9 @@ public interface MovementHelper extends ActionCosts, Helper {
             return NO;
         }
         if (block instanceof DoorBlock || block instanceof FenceGateBlock) {
+            if (!Baritone.settings().allowInteract.value) {
+                return NO;
+            }
             // TODO this assumes that all doors in all mods are openable
             if (block == Blocks.IRON_DOOR) {
                 return NO;

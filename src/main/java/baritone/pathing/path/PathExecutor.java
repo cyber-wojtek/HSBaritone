@@ -47,8 +47,8 @@ import static baritone.api.pathing.movement.MovementStatus.*;
  */
 public class PathExecutor implements IPathExecutor, Helper {
 
-    private static final double MAX_MAX_DIST_FROM_PATH = 3;
-    private static final double MAX_DIST_FROM_PATH = 2;
+    private static final double MAX_MAX_DIST_FROM_PATH = 4;
+    private static final double MAX_DIST_FROM_PATH = 3;
 
     /**
      * Default value is equal to 10 seconds. It's find to decrease it, but it must be at least 5.5s (110 ticks).
@@ -344,11 +344,10 @@ public class PathExecutor implements IPathExecutor, Helper {
     private boolean shouldSprintNextTick() {
         boolean requested = behavior.baritone.getInputOverrideHandler().isInputForcedDown(Input.SPRINT);
 
-        // we'll take it from here, no need for minecraft to see we're holding down control and sprint for us
-        behavior.baritone.getInputOverrideHandler().setInputForceState(Input.SPRINT, false);
-
         // first and foremost, if allowSprint is off, or if we don't have enough hunger, don't try and sprint
         if (!new CalculationContext(behavior.baritone, false).canSprint) {
+            // clear sprint override if we can't sprint
+            behavior.baritone.getInputOverrideHandler().setInputForceState(Input.SPRINT, false);
             return false;
         }
         IMovement current = path.movements().get(pathPosition);
@@ -471,6 +470,9 @@ public class PathExecutor implements IPathExecutor, Helper {
                 return true;
             }
         }
+        // Only clear sprint override if we decided not to sprint
+        // This prevents flickering when movements request sprint but conditions change mid-tick
+        behavior.baritone.getInputOverrideHandler().setInputForceState(Input.SPRINT, false);
         return false;
     }
 

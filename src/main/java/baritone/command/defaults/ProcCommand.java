@@ -49,7 +49,7 @@ public class ProcCommand extends Command {
                         "Priority: %f\n" +
                         "Temporary: %b\n" +
                         "Display name: %s\n" +
-                        "Last command: %s",
+                                "Last command: %s",
                 process.getClass().getTypeName(),
                 process.priority(),
                 process.isTemporary(),
@@ -57,7 +57,7 @@ public class ProcCommand extends Command {
                 pathingControlManager
                         .mostRecentCommand()
                         .map(PathingCommand::toString)
-                        .orElse("None")
+                                        .orElse("None")
         ));
     }
 

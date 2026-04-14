@@ -734,6 +734,9 @@ public final class ElytraBehavior implements Helper {
     }
 
     private void tickUseFireworks(final Vec3 start, final Vec3 goingTo, final boolean isBoosted, final boolean forceUseFirework) {
+        if (!Baritone.settings().allowInteract.value) {
+            return;
+        }
         if (this.remainingSetBackTicks > 0) {
             logDebug("waiting for elytraFireworkSetbackUseDelay: " + this.remainingSetBackTicks);
             return;

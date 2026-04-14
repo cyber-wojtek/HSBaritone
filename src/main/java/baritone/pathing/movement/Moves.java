@@ -22,6 +22,9 @@ import baritone.pathing.movement.movements.*;
 import baritone.utils.pathing.MutableMoveResult;
 import net.minecraft.core.Direction;
 
+import java.util.ArrayList;
+import java.util.List;
+
 /**
  * An enum of all possible movements attached to all possible directions they could be taken in
  *
@@ -276,51 +279,15 @@ public enum Moves {
         }
     },
 
-    PARKOUR_NORTH(0, 0, -4, true, true) {
+    PARKOUR_DYNAMIC(0, 0, 0, true, true) {
         @Override
         public Movement apply0(CalculationContext context, BetterBlockPos src) {
-            return MovementParkour.cost(context, src, Direction.NORTH);
+            throw new UnsupportedOperationException("Parkour dynamic move doesn't support calling apply0");
         }
 
         @Override
         public void apply(CalculationContext context, int x, int y, int z, MutableMoveResult result) {
-            MovementParkour.cost(context, x, y, z, Direction.NORTH, result);
-        }
-    },
-
-    PARKOUR_SOUTH(0, 0, +4, true, true) {
-        @Override
-        public Movement apply0(CalculationContext context, BetterBlockPos src) {
-            return MovementParkour.cost(context, src, Direction.SOUTH);
-        }
-
-        @Override
-        public void apply(CalculationContext context, int x, int y, int z, MutableMoveResult result) {
-            MovementParkour.cost(context, x, y, z, Direction.SOUTH, result);
-        }
-    },
-
-    PARKOUR_EAST(+4, 0, 0, true, true) {
-        @Override
-        public Movement apply0(CalculationContext context, BetterBlockPos src) {
-            return MovementParkour.cost(context, src, Direction.EAST);
-        }
-
-        @Override
-        public void apply(CalculationContext context, int x, int y, int z, MutableMoveResult result) {
-            MovementParkour.cost(context, x, y, z, Direction.EAST, result);
-        }
-    },
-
-    PARKOUR_WEST(-4, 0, 0, true, true) {
-        @Override
-        public Movement apply0(CalculationContext context, BetterBlockPos src) {
-            return MovementParkour.cost(context, src, Direction.WEST);
-        }
-
-        @Override
-        public void apply(CalculationContext context, int x, int y, int z, MutableMoveResult result) {
-            MovementParkour.cost(context, x, y, z, Direction.WEST, result);
+            throw new UnsupportedOperationException("Parkour dynamic move doesn't support calling apply");
         }
     };
 

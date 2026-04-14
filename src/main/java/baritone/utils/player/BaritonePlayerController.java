@@ -17,6 +17,7 @@
 
 package baritone.utils.player;
 
+import baritone.Baritone;
 import baritone.api.utils.IPlayerController;
 import baritone.utils.accessor.IPlayerControllerMP;
 import net.minecraft.client.Minecraft;
@@ -26,10 +27,13 @@ import net.minecraft.core.Direction;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.inventory.ClickType;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.BlockHitResult;
+
+import java.util.Locale;
 
 
 /**
@@ -78,13 +82,28 @@ public final class BaritonePlayerController implements IPlayerController {
 
     @Override
     public InteractionResult processRightClickBlock(LocalPlayer player, Level world, InteractionHand hand, BlockHitResult result) {
+        if (!Baritone.settings().allowInteract.value && !isSkyblockTeleportItem(player, hand)) {
+            return InteractionResult.PASS;
+        }
         // primaryplayercontroller is always in a ClientWorld so this is ok
         return mc.gameMode.useItemOn(player, hand, result);
     }
 
     @Override
     public InteractionResult processRightClick(LocalPlayer player, Level world, InteractionHand hand) {
+        if (!Baritone.settings().allowInteract.value && !isSkyblockTeleportItem(player, hand)) {
+            return InteractionResult.PASS;
+        }
         return mc.gameMode.useItem(player, hand);
+    }
+
+    private static boolean isSkyblockTeleportItem(LocalPlayer player, InteractionHand hand) {
+        if (!Baritone.settings().skyblockTransportEnabled.value) {
+            return false;
+        }
+        ItemStack stack = player.getItemInHand(hand);
+        String name = stack.getHoverName().getString().toLowerCase(Locale.ROOT);
+        return name.contains("aspect of the end") || name.contains("aspect of the void");
     }
 
     @Override

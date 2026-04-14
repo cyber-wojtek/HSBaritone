@@ -36,6 +36,9 @@ public class BlockPlaceHelper {
     }
 
     public void tick(boolean rightClickRequested) {
+        if (!Baritone.settings().allowInteract.value) {
+            return;
+        }
         if (rightClickTimer > 0) {
             rightClickTimer--;
             return;
